@@ -1,0 +1,24 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Android 构建产物
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+*.apk
+
+# 运行时状态（含个人语音数据，严禁入库）
+recordings/
+.level
+.phonemic_last_url
+.phonemic_lock
+gain_db
+denoise
+record
+icons/
+
+# 系统
+.DS_Store
