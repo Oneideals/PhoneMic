@@ -17,8 +17,10 @@
 """
 import argparse
 import fcntl
+import ipaddress
 import queue
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -31,13 +33,18 @@ from pathlib import Path
 import numpy as np
 import sounddevice as sd
 
-BASE = Path.home() / "GitHub" / "PhoneMic"
+BASE = Path.home() / "LocalStorage" / "GitHub" / "PhoneMic"
 LAST_URL_FILE = BASE / ".phonemic_last_url"
 LOCK_FILE = BASE / ".phonemic_lock"
 GAIN_FILE = BASE / "gain_db"        # 数字增益（dB），菜单栏应用写入，引擎每秒读取
 LEVEL_FILE = BASE / ".level"        # 引擎实时输出电平（0~100），菜单栏读取显示
 RECORD_FILE = BASE / "record"       # 录音存档开关（"1"=开启）
+PTT_FILE = BASE / ".ptt"            # 录音开关状态（"1"=录音中，单击右⌥切换），菜单栏监听写入
 REC_DIR = BASE / "recordings"       # 录音与指标文件目录
+PTT_MIN_SEGMENT = 0.3               # 短于此秒数的录音段视为误触，丢弃
+RECONNECT_FILE = BASE / ".reconnect"   # 菜单栏「立即重连」信号（存在即触发）
+UDP_ANNOUNCE_PORT = 58080           # 电脑监听：手机 UDP 公告（mDNS 失效时的兜底通道）
+UDP_QUERY_PORT = 58081              # 手机监听：电脑 UDP 查询（手动重连快车道）
 OUTPUT_HINT = "BlackHole"
 PREFILL_SECONDS = 0.30      # 预缓冲：300ms 常数延迟换零欠载（欠载丢音节=识别错误）
 CANDIDATE_PORTS = [8081, 18080, 28080, 8080]
@@ -47,18 +54,54 @@ GAIN_DB = {"v": 0.0}
 # 绕过系统代理/环境变量，局域网直连（代理会对局域网流间歇性返回 404）
 DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
+# 必须持有文件对象引用：否则函数返回后被垃圾回收，文件关闭，flock 随之释放
+_LOCK_FH = None
+
+
+class _PipeSafeStdout:
+    """菜单栏父进程被强杀后 stdout 管道断裂，继续打印会抛 BrokenPipeError 杀死引擎。
+
+    管道断裂后自动切换为静默丢弃：引擎继续拉流/录音，等菜单栏回来再由
+    单实例锁自然接管，音频不中断。
+    """
+
+    def __init__(self, fh):
+        self._fh = fh
+        self._dead = False
+
+    def write(self, s):
+        if self._dead:
+            return len(s)
+        try:
+            return self._fh.write(s)
+        except (BrokenPipeError, ValueError, OSError):
+            self._dead = True
+            return len(s)
+
+    def flush(self):
+        if not self._dead:
+            try:
+                self._fh.flush()
+            except Exception:
+                self._dead = True
+
+    def isatty(self):
+        return False
+
 
 def acquire_lock() -> bool:
     """保证全机只有一个 PhoneMic 实例在写 BlackHole。"""
+    global _LOCK_FH
     LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
     fh = open(LOCK_FILE, "w")
     try:
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
         fh.write(str(__import__("os").getpid()))
         fh.flush()
-        return True
     except OSError:
         return False
+    _LOCK_FH = fh
+    return True
 
 
 def discover_mdns(timeout: float = 4.0) -> str | None:
@@ -74,8 +117,16 @@ def discover_mdns(timeout: float = 4.0) -> str | None:
             try:
                 info = zc.get_service_info(type_, name, 3000)
                 if info and info.addresses and info.port:
-                    ip = socket.inet_ntoa(info.addresses[0])
-                    result[f"http://{ip}:{info.port}"] = name
+                    for raw in info.addresses:
+                        try:
+                            ip = socket.inet_ntoa(raw)
+                            o = ipaddress.ip_address(ip)
+                            if not (o.is_private and not o.is_loopback and not o.is_link_local):
+                                continue   # 跳过回环/链路本地等非法解析结果
+                        except Exception:
+                            continue
+                        result[f"http://{ip}:{info.port}"] = name
+                        break
             except Exception:
                 pass
 
@@ -103,9 +154,11 @@ def discover_mdns(timeout: float = 4.0) -> str | None:
     return next(iter(result), None)
 
 
-def scan_host_for_riff(host: str, timeout: float = 1.5) -> str | None:
-    """对一台主机的候选端口发探测请求，返回第一个返回 WAV 流的地址。"""
-    for port in CANDIDATE_PORTS:
+def scan_host_for_riff(host: str, timeout: float = 0.6) -> str | None:
+    """并行探测候选端口（手机在已知主机但 mDNS/UDP 都失效时的最后手段）。"""
+    hits: dict = {}
+
+    def probe(port):
         url = f"http://{host}:{port}/audio.wav"
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "PhoneMic/1.0"})
@@ -113,28 +166,110 @@ def scan_host_for_riff(host: str, timeout: float = 1.5) -> str | None:
             head = resp.read(4)
             resp.close()
             if head == b"RIFF":
-                return url
+                hits[port] = url
         except Exception:
-            continue
-    return None
+            pass
+
+    threads = [threading.Thread(target=probe, args=(p,), daemon=True)
+               for p in CANDIDATE_PORTS]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout + 0.3)
+    return hits[min(hits)] if hits else None   # 端口号小者优先，与原串行顺序一致
+
+
+# 最新手机 UDP 公告缓存：手机无客户端时每秒广播一次，
+# 是 mDNS 失效（Android 回网后 NsdManager 重注册不可靠）时的兜底发现通道
+_ANNOUNCE = {"url": None, "at": 0.0}
+
+
+def udp_announce_listener():
+    """常驻后台：监听手机 'PHONEMIC <port>' 公告，更新缓存。"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("", UDP_ANNOUNCE_PORT))
+    except Exception:
+        return   # 端口被占（如另一实例）：公告通道让位于锁持有者
+    while True:
+        try:
+            data, addr = s.recvfrom(256)
+            msg = data.decode("utf-8", "ignore").strip()
+            if msg.startswith("PHONEMIC ") and msg[8:].strip().isdigit():
+                _ANNOUNCE["url"] = f"http://{addr[0]}:{msg[8:].strip()}"
+                _ANNOUNCE["at"] = time.time()
+        except Exception:
+            time.sleep(0.5)
+
+
+def send_udp_query():
+    """广播查询：手机收到后立即回公告，绕过 mDNS 直接定位（手动重连快车道）。"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        s.sendto(b"PHONEMIC_QUERY", ("255.255.255.255", UDP_QUERY_PORT))
+        s.close()
+    except Exception:
+        pass
+
+
+def reconnect_requested() -> bool:
+    """菜单栏「立即重连」信号：存在即消费。"""
+    try:
+        if RECONNECT_FILE.exists():
+            RECONNECT_FILE.unlink()
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def resolve_url(explicit: str | None) -> str | None:
-    """显式地址 > mDNS > 上次地址 > 上次主机扫端口。"""
+    """显式地址 > 新公告 > （上次地址 ∥ mDNS ∥ UDP 查询）并行 > 上次主机扫端口。"""
     if explicit:
         return explicit
-    print("[发现] 正在局域网寻找手机（mDNS，最多 4 秒）…", flush=True)
-    url = discover_mdns()
-    if url:
-        print(f"[发现] mDNS 找到：{url}", flush=True)
-        return url
-    last = LAST_URL_FILE.read_text().strip() if LAST_URL_FILE.exists() else None
+    t_start = time.time()
+    if _ANNOUNCE["url"] and t_start - _ANNOUNCE["at"] < 5:
+        print(f"[发现] UDP 公告命中：{_ANNOUNCE['url']}", flush=True)
+        return _ANNOUNCE["url"]
+
+    print("[发现] 正在寻找手机（公告/上次地址/mDNS 并行）…", flush=True)
+    send_udp_query()
+    last = LAST_URL_FILE.read_text().strip() if LAST_URL_FILE.exists() else ""
+    box: dict = {"mdns": None, "last": None}
+
+    def mdns_task():
+        box["mdns"] = discover_mdns(4.0)
+
+    def last_task():
+        box["last"] = last if (last and probe_ok(last)) else None
+
     if last:
-        print(f"[发现] mDNS 未找到，尝试上次地址：{last}", flush=True)
-        if probe_ok(last):
-            return last
+        # 有历史地址：并行跑 mDNS 和直连探测，谁先命中用谁
+        threading.Thread(target=last_task, daemon=True).start()
+    threading.Thread(target=mdns_task, daemon=True).start()
+
+    deadline = time.time() + 4.5
+    while time.time() < deadline:
+        if box["last"]:
+            print(f"[发现] 上次地址仍可用：{box['last']}", flush=True)
+            return box["last"]                      # IP 未变，最快路径
+        if _ANNOUNCE["url"] and _ANNOUNCE["at"] >= t_start:
+            print(f"[发现] UDP 查询应答：{_ANNOUNCE['url']}", flush=True)
+            return _ANNOUNCE["url"]                  # 查询带回的新公告
+        if box["mdns"]:
+            print(f"[发现] mDNS 找到：{box['mdns']}", flush=True)
+            return box["mdns"]
+        time.sleep(0.1)
+
+    # 超时兜底：扫上次主机的候选端口（IP 变了但主机在线的情况）
+    if last:
+        # 扫描前再查一次公告（等待循环结束到这里的间隙里手机可能刚好回来）
+        if _ANNOUNCE["url"] and _ANNOUNCE["at"] >= t_start:
+            print(f"[发现] UDP 查询应答：{_ANNOUNCE['url']}", flush=True)
+            return _ANNOUNCE["url"]
         host = last.split("//")[-1].split(":")[0]
-        print(f"[发现] 上次地址失效，扫描 {host} 的候选端口…", flush=True)
         url = scan_host_for_riff(host)
         if url:
             print(f"[发现] 扫描命中：{url}", flush=True)
@@ -212,12 +347,112 @@ def recording_enabled() -> bool:
         return False
 
 
-class StreamTee:
-    """代理音频流：先把头部 payload 回放给下游，之后透传；可选同步写入录音文件。"""
+def save_flac(stamp: str) -> None:
+    """把一段录音 WAV 无损转存为 FLAC 并删除源文件（后台线程执行）。"""
+    wav_path = REC_DIR / f"{stamp}.wav"
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        print(f"[录音] 保留 WAV：{wav_path.name}（未安装 ffmpeg）", flush=True)
+        return
+    try:
+        subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", str(wav_path),
+                        "-c:a", "flac", str(wav_path.with_suffix(".flac"))],
+                       check=True, capture_output=True)
+        wav_path.unlink()
+        print(f"[录音] 已存档：{stamp}.flac", flush=True)
+    except Exception:
+        print(f"[录音] 保留 WAV：{wav_path.name}（转码失败）", flush=True)
 
-    def __init__(self, resp, wav, initial):
+
+class PttRecorder:
+    """PTT 录音：仅录音开关激活（.ptt=1，单击右⌥切换）期间写入音频。
+
+    每段生成一个独立文件，开关关闭即收尾并后台转 FLAC；
+    短于 PTT_MIN_SEGMENT 的段视为误触直接丢弃。不激活时完全不占空间。
+    """
+
+    def __init__(self, ch: int, rate: int, bits: int):
+        self.ch, self.rate, self.bits = ch, rate, bits
+        self.wav = None
+        self.stamp = None
+        self._cache = (0.0, False)
+        self._savers = []   # 在途的 WAV→FLAC 转码线程
+
+    def _ptt_on(self) -> bool:
+        # 50ms 缓存：读文件频率足够低，开关延迟足够小
+        now = time.time()
+        if now - self._cache[0] > 0.05:
+            try:
+                on = PTT_FILE.exists() and PTT_FILE.read_text().strip() == "1"
+            except Exception:
+                on = False
+            self._cache = (now, on)
+        return self._cache[1]
+
+    def write(self, chunk: bytes) -> None:
+        if self._ptt_on():
+            if self.wav is None:
+                try:
+                    import wave
+                    REC_DIR.mkdir(parents=True, exist_ok=True)
+                    self.stamp = (time.strftime("%Y%m%d-%H%M%S")
+                                  + f"-{int(time.time() * 1000) % 1000:03d}")
+                    self.wav = wave.open(str(REC_DIR / f"{self.stamp}.wav"), "wb")
+                    self.wav.setnchannels(self.ch)
+                    self.wav.setsampwidth(self.bits // 8)
+                    self.wav.setframerate(self.rate)
+                    print(f"[录音] 开始记录：{self.stamp}.wav", flush=True)
+                except Exception as e:
+                    print(f"[录音] 开段失败：{e}", flush=True)
+                    self.wav = None
+            if self.wav is not None:
+                try:
+                    self.wav.writeframesraw(chunk)
+                except Exception:
+                    pass
+        elif self.wav is not None:
+            self.close_segment()
+
+    def close_segment(self) -> None:
+        wav, stamp = self.wav, self.stamp
+        self.wav, self.stamp = None, None
+        if wav is None:
+            return
+        try:
+            dur = wav.getnframes() / self.rate
+            wav.close()
+        except Exception:
+            return
+        if dur < PTT_MIN_SEGMENT:
+            try:
+                (REC_DIR / f"{stamp}.wav").unlink()
+                print(f"[录音] 段过短（{dur:.1f}s），已丢弃", flush=True)
+            except Exception:
+                pass
+            return
+        t = threading.Thread(target=save_flac, args=(stamp,), daemon=True)
+        self._savers.append(t)
+        t.start()
+
+    def close(self) -> None:
+        """退出/断流前收尾当前段，并等待在途转码完成。
+
+        转码线程是 daemon：不 join 的话进程退出时线程被杀，ffmpeg 孤儿进程
+        虽能产出 FLAC，但源 WAV 的删除不会执行（残留 .wav）。
+        """
+        self.close_segment()
+        for t in self._savers:
+            if t.is_alive():
+                t.join(timeout=10)
+        self._savers = [t for t in self._savers if t.is_alive()]
+
+
+class StreamTee:
+    """代理音频流：先把头部 payload 回放给下游，之后透传；可选交给录音器写入。"""
+
+    def __init__(self, resp, recorder, initial):
         self.resp = resp
-        self.wav = wav
+        self.recorder = recorder
         self.buf = initial
 
     def read(self, n):
@@ -227,41 +462,37 @@ class StreamTee:
             chunk = self.resp.read(n)
             if not chunk:
                 return chunk
-        if self.wav:
-            try:
-                self.wav.writeframesraw(chunk)
-            except Exception:
-                pass
+        if self.recorder:
+            self.recorder.write(chunk)
         return chunk
 
 
 def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
     req = urllib.request.Request(url, headers={"User-Agent": "PhoneMic/1.0"})
-    resp = DIRECT_OPENER.open(req, timeout=6)
+    # timeout 同时约束连接与每次 read：手机离开 WiFi 范围时不会有 TCP RST，
+    # 靠这个读超时把"无限挂起"压到 3 秒内检测（正常流每 ~128ms 就有一块数据）
+    resp = DIRECT_OPENER.open(req, timeout=3)
+    raw_resp = resp
     payload, (ch, rate, bits) = wav_head_and_payload(resp)
     dtype = DTYPES.get(bits)
     if dtype is None:
         raise ValueError(f"不支持的位深 {bits}bit（请在手机端把音频格式设为 PCM 16bit）")
     t0 = time.time()
 
-    # 录音存档（可选）：记录手机采集的原始音频 + 电平/指标时间线
-    rec_wav, meta_fh, rec_stamp = None, None, time.strftime("%Y%m%d-%H%M%S")
+    # 录音存档（可选，PTT 模式）：只有按住右 Option 期间的音频才落盘；
+    # 电平/指标时间线仍全程记录（体积可忽略）
+    recorder, meta_fh, rec_stamp = None, None, time.strftime("%Y%m%d-%H%M%S")
     if recording_enabled():
         try:
             REC_DIR.mkdir(parents=True, exist_ok=True)
-            import wave
-            rec_wav = wave.open(str(REC_DIR / f"{rec_stamp}.wav"), "wb")
-            rec_wav.setnchannels(ch)
-            rec_wav.setsampwidth(bits // 8)
-            rec_wav.setframerate(rate)
-            rec_wav.writeframesraw(payload)
+            recorder = PttRecorder(ch, rate, bits)
             meta_fh = open(REC_DIR / f"{rec_stamp}.meta.csv", "w")
             meta_fh.write("elapsed_sec,level_pct,underruns,clipped\n")
-            print(f"[录音] 存档中：{rec_stamp}.wav（原始信号，未加增益/降噪）", flush=True)
+            print("[录音] PTT 模式：按右⌥开始记录，再按结束并存档 FLAC", flush=True)
         except Exception as e:
             print(f"[录音] 启动失败：{e}", flush=True)
-            rec_wav, meta_fh = None, None
-    resp = StreamTee(resp, rec_wav, payload)
+            recorder, meta_fh = None, None
+    resp = StreamTee(resp, recorder, payload)
     payload = b""
 
     # 降噪（可选）：ffmpeg afftdn 过滤电脑风扇等稳态噪声
@@ -326,6 +557,9 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
                     except queue.Empty:
                         pass
                     q.put_nowait(chunk)
+        except (TimeoutError, socket.timeout):
+            if not stop.is_set():
+                print("\n[连接] 断开：3 秒无数据（手机离网或 Wi-Fi 中断）", flush=True)
         except Exception as e:
             if not stop.is_set():
                 print(f"\n[连接] 断开：{e}", flush=True)
@@ -361,59 +595,56 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
     time.sleep(PREFILL_SECONDS)
 
     print(f"[音频] {rate} Hz / {ch} ch / {bits}bit，写入 BlackHole…（Ctrl+C 退出）", flush=True)
-    with sd.OutputStream(device=out_idx, samplerate=rate, channels=ch,
-                         dtype=dtype, callback=callback):
-        last_report = 0.0
-        while not stop.is_set() and t.is_alive():
-            time.sleep(0.5)
-            now = time.time()
-            try:
-                LEVEL_FILE.write_text(str(stat.get("peak", 0)))
-            except Exception:
-                pass
-            if meta_fh:
+    try:
+        with sd.OutputStream(device=out_idx, samplerate=rate, channels=ch,
+                             dtype=dtype, callback=callback):
+            last_report = 0.0
+            while not stop.is_set() and t.is_alive():
+                time.sleep(0.5)
+                now = time.time()
                 try:
-                    meta_fh.write(f"{now - t0:.1f},{stat.get('peak', 0)},"
-                                  f"{stat['underruns']},{stat.get('clipped', 0)}\n")
-                    meta_fh.flush()
+                    LEVEL_FILE.write_text(str(stat.get("peak", 0)))
                 except Exception:
                     pass
-            buffered_ms = q.qsize() * 4096 / byte_rate * 1000
-            if now - last_report > 10:
-                last_report = now
-                print(f"[状态] 运行中 缓冲≈{buffered_ms:.0f}ms 峰值{stat.get('peak', 0)}% "
-                      f"欠载{stat['underruns']}次 削波{stat.get('clipped', 0)}次", flush=True)
-    if rec_wav:
-        try:
-            rec_wav.close()
-        except Exception:
-            pass
-    if meta_fh:
-        try:
-            meta_fh.close()
-        except Exception:
-            pass
-    if rec_wav:
-        wav_path = REC_DIR / f"{rec_stamp}.wav"
-        ffmpeg = shutil.which("ffmpeg")
-        if ffmpeg:
+                if meta_fh:
+                    try:
+                        meta_fh.write(f"{now - t0:.1f},{stat.get('peak', 0)},"
+                                      f"{stat['underruns']},{stat.get('clipped', 0)}\n")
+                        meta_fh.flush()
+                    except Exception:
+                        pass
+                buffered_ms = q.qsize() * 4096 / byte_rate * 1000
+                if now - last_report > 10:
+                    last_report = now
+                    print(f"[状态] 运行中 缓冲≈{buffered_ms:.0f}ms 峰值{stat.get('peak', 0)}% "
+                          f"欠载{stat['underruns']}次 削波{stat.get('clipped', 0)}次", flush=True)
+    finally:
+        # 无论正常结束还是异常/SIGTERM 退出，录音段都要正确收尾（回写头部长度）
+        if recorder:
             try:
-                subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", str(wav_path),
-                                "-c:a", "flac", str(wav_path.with_suffix(".flac"))],
-                               check=True, capture_output=True)
-                wav_path.unlink()
-                print(f"[录音] 已转存 FLAC：{rec_stamp}.flac", flush=True)
+                recorder.close()
             except Exception:
-                print(f"[录音] 保留 WAV：{wav_path.name}（转码失败）", flush=True)
-    if ff is not None:
+                pass
+        if meta_fh:
+            try:
+                meta_fh.close()
+            except Exception:
+                pass
+        if ff is not None:
+            try:
+                ff.kill()
+            except Exception:
+                pass
         try:
-            ff.kill()
+            raw_resp.close()   # 主动关流：手机端收 RST 后清掉客户端、恢复 UDP 公告
         except Exception:
             pass
     raise ConnectionError("音频流结束（服务器关闭或流中断），准备重连")
 
 
 def main():
+    sys.stdout = _PipeSafeStdout(sys.stdout)
+    sys.stderr = _PipeSafeStdout(sys.stderr)
     ap = argparse.ArgumentParser(description="把手机麦克风变成 Mac 输入设备")
     ap.add_argument("url", nargs="?", help="手机音频流地址（不填则自动发现）")
     ap.add_argument("--auto", action="store_true", help="自动发现模式（发现→缓存→扫描 三级回退）")
@@ -432,36 +663,56 @@ def main():
     out_idx, out_name = find_output(args.device or OUTPUT_HINT)
     print(f"[输出] {out_name}", flush=True)
     threading.Thread(target=gain_watcher, daemon=True).start()
+    threading.Thread(target=udp_announce_listener, daemon=True).start()
 
     stop = threading.Event()
-    backoff = 2
+    # 菜单栏应用用 SIGTERM 结束引擎：置 stop 让录音收尾/资源释放走正常路径，而不是被硬杀
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
     fails = 0
-    while not stop.is_set():
-        # 地址解析：显式地址只在首次用；之后每次重连都重新发现（--auto 时）
-        url = args.url
-        if args.auto or not url:
-            url = resolve_url(None if args.auto else (args.url if fails == 0 else None))
-        if not url:
-            print("[发现] 8 秒后重新寻找手机…（Ctrl+C 退出）", flush=True)
-            stop.wait(8)
-            continue
-        if fails == 0 or args.auto:
+
+    def wait_interruptible(seconds: float, reason: str = ""):
+        """可被 打断的等待：Ctrl+C / 菜单「立即重连」/ 手机新公告。"""
+        if reason:
+            print(f"{reason}（Ctrl+C 退出，菜单「立即重连」可跳过）", flush=True)
+        ann_at = _ANNOUNCE["at"]
+        end = time.time() + seconds
+        while time.time() < end and not stop.is_set():
+            if reconnect_requested() or _ANNOUNCE["at"] != ann_at:
+                return   # 手机回来了 / 用户点了立即重连：立刻进入发现
+            time.sleep(0.1)
+
+    try:
+        while not stop.is_set():
+            # 地址解析：显式地址只在首次用；之后每次重连都重新发现（--auto 时）
+            url = args.url
+            if args.auto or not url:
+                url = resolve_url(None if args.auto else (args.url if fails == 0 else None))
+            if not url:
+                wait_interruptible(2, "[发现] 2 秒后重新寻找手机…")
+                continue
+            if fails == 0 or args.auto:
+                try:
+                    LAST_URL_FILE.write_text(url)
+                except Exception:
+                    pass
+            t_stream = time.time()
             try:
-                LAST_URL_FILE.write_text(url)
-            except Exception:
-                pass
-        try:
-            stream_once(url, out_idx, stop)
-            return
-        except KeyboardInterrupt:
-            stop.set()
-            print("\n已退出", flush=True)
-            return
-        except Exception as e:
-            fails += 1
-            backoff = min(2 * (2 ** min(fails, 3)), 10)
-            print(f"[连接] {e}（连续失败 {fails} 次），{backoff}s 后重试", flush=True)
-            stop.wait(backoff)
+                stream_once(url, out_idx, stop)
+                return
+            except KeyboardInterrupt:
+                stop.set()
+                print("\n已退出", flush=True)
+                return
+            except Exception as e:
+                # 上次是真会话（连上并正常跑了一阵）则不算连接失败，退避重新计数
+                if time.time() - t_stream > 15:
+                    fails = 0
+                fails += 1
+                backoff = min(fails, 6)   # 1,2,3…6：首次失败 1 秒后就重试（发现本身很快）
+                wait_interruptible(backoff, f"[连接] {e}（第 {fails} 次失败），{backoff}s 后重试")
+    except KeyboardInterrupt:
+        stop.set()
+        print("\n已退出", flush=True)
 
 
 if __name__ == "__main__":

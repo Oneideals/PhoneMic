@@ -18,7 +18,11 @@ recordings/
 gain_db
 denoise
 record
+.ptt
 icons/
 
 # 系统
 .DS_Store
+sysinput
+.prev_input
+.menu_lock

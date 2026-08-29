@@ -1,8 +1,10 @@
 package com.jerry.phonemic;
 
 import android.Manifest;
+import android.app.PendingIntent;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.os.Build;
 import android.os.Handler;
 import android.service.quicksettings.Tile;
 import android.service.quicksettings.TileService;
@@ -22,6 +24,24 @@ public class MicTileService extends TileService {
         handler.postDelayed(this::update, 600);
     }
 
+    /** 打开主界面：Android 14+ 禁止磁贴直接 startActivity(Intent)，必须走 PendingIntent。 */
+    private void openMainActivity(boolean autostart) {
+        Intent m = new Intent(this, MainActivity.class);
+        m.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        if (autostart) m.putExtra("autostart", true);
+        try {
+            if (Build.VERSION.SDK_INT >= 34) {
+                PendingIntent pi = PendingIntent.getActivity(this, 0, m,
+                        PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+                startActivityAndCollapse(pi);
+            } else {
+                startActivityAndCollapse(m);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "打开主界面失败", e);
+        }
+    }
+
     @Override
     public void onClick() {
         boolean running = MicService.RUNNING || MicService.PORT_BOUND > 0;
@@ -39,15 +59,24 @@ public class MicTileService extends TileService {
                 Log.d(TAG, "startForegroundService 已调用");
             } else {
                 Log.w(TAG, "无麦克风权限，打开主界面授权");
-                Intent m = new Intent(this, MainActivity.class);
-                m.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                startActivity(m);
+                openMainActivity(false);
             }
         } catch (Exception e) {
             Log.e(TAG, "磁贴操作异常", e);
         }
         update();
-        handler.postDelayed(this::update, 800);
+        handler.postDelayed(() -> {
+            // Android 14+：若系统拒绝了从磁贴启动（mic FGS 需 eligible 状态），
+            // 转跳主界面自动补启动（界面可见即 eligible）
+            if (MicService.FGS_BLOCKED) {
+                MicService.FGS_BLOCKED = false;
+                if (!MicService.RUNNING && MicService.PORT_BOUND <= 0) {
+                    openMainActivity(true);
+                    return;
+                }
+            }
+            update();
+        }, 800);
     }
 
     private void update() {

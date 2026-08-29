@@ -28,7 +28,7 @@ public class MainActivity extends Activity {
     private static final String PREFS = "phonemic";
     private static final String KEY_GAIN = "gain_db";
 
-    private MaterialButton btnToggle, gainDown, gainUp;
+    private MaterialButton btnToggle, gainDown, gainUp, btnNotify;
     private TextView statusText, levelText, peakText, gainLabel, addrText;
     private LinearProgressIndicator levelBar;
     private final Handler ticker = new Handler();
@@ -173,11 +173,63 @@ public class MainActivity extends Activity {
         blp.topMargin = dp(20);
         root.addView(btnToggle, blp);
 
+        // ── 通知电脑（断线后手动快连：立即广播 3 次，电脑收到即秒连） ──
+        btnNotify = new MaterialButton(this, null,
+                com.google.android.material.R.attr.materialButtonOutlinedStyle);
+        btnNotify.setTextSize(15);
+        btnNotify.setText("通知电脑立即重连");
+        btnNotify.setOnClickListener(v -> {
+            if (MicService.RUNNING || MicService.PORT_BOUND > 0) {
+                MicService.announceNow();
+                android.widget.Toast.makeText(this,
+                        "已广播，电脑将在 1~2 秒内重连", android.widget.Toast.LENGTH_SHORT).show();
+            } else {
+                android.widget.Toast.makeText(this,
+                        "服务未启动，请先启动麦克风服务", android.widget.Toast.LENGTH_SHORT).show();
+            }
+        });
+        LinearLayout.LayoutParams nlp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(48));
+        nlp.topMargin = dp(10);
+        root.addView(btnNotify, nlp);
+
         refresh();
+        maybeAutostart(getIntent());
+    }
+
+    /** 从磁贴转跳而来时自动补启动服务（界面此刻可见，满足 mic FGS 的 eligible 状态）。 */
+    private void maybeAutostart(Intent intent) {
+        if (intent == null || !intent.getBooleanExtra("autostart", false)) return;
+        if (MicService.RUNNING || MicService.PORT_BOUND > 0) return;
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{
+                    Manifest.permission.RECORD_AUDIO,
+                    Manifest.permission.POST_NOTIFICATIONS}, 1);
+            return;
+        }
+        startForegroundService(new Intent(this, MicService.class));
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        maybeAutostart(intent);
     }
 
     @Override protected void onResume() { super.onResume(); ticker.post(tick); }
     @Override protected void onPause() { super.onPause(); ticker.removeCallbacks(tick); }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions,
+                                           int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode != 1 || grantResults.length == 0) return;
+        // 麦克风权限到手后直接启动服务，用户不必再按一次
+        if (grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            startForegroundService(new Intent(this, MicService.class));
+            refresh();
+        }
+    }
 
     private void adjustGain(int delta) {
         float v = MicService.GAIN_DB + delta;

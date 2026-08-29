@@ -33,8 +33,13 @@ public class MicService extends Service {
     private static volatile long PEAK_HOLD_AT = 0;
     /** 累计削波采样数：不增长 = 增益安全 */
     public static volatile int CLIPS = 0;
+    /** Android 14+ 从非 eligible 状态（如磁贴）启动 mic FGS 被系统拒绝时置位，磁贴据此转跳主界面 */
+    public static volatile boolean FGS_BLOCKED = false;
     private static final int[] CANDIDATE_PORTS = {8080, 8081, 18080, 28080};
     private static final int RATE = 48000;
+    /** UDP 直连通道：电脑监听 58080 收公告，手机监听 58081 收查询（绕过 mDNS 的兜底） */
+    private static final int ANNOUNCE_PORT = 58080;
+    private static final int QUERY_PORT = 58081;
 
     private final CopyOnWriteArrayList<OutputStream> clients = new CopyOnWriteArrayList<>();
     private AudioRecord record;
@@ -75,7 +80,18 @@ public class MicService extends Service {
                     getSharedPreferences("phonemic", MODE_PRIVATE);
             GAIN_DB = sp.getFloat("gain_db", 0f);
         } catch (Exception ignored) {}
-        startForeground(1, buildNotification());
+        try {
+            startForeground(1, buildNotification());
+        } catch (Exception e) {
+            // Android 14+：麦克风类型 FGS 只能在 eligible 状态（如界面可见）启动，
+            // 从磁贴等后台入口启动会被系统拒绝。不能崩溃循环，置标志让磁贴转跳主界面补启动。
+            android.util.Log.w("PhoneMic.Svc", "startForeground 被拒绝（非 eligible 状态）: " + e);
+            running = false;
+            RUNNING = false;
+            FGS_BLOCKED = true;
+            stopSelf();
+            return;
+        }
 
         int minBuf = AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT);
@@ -95,7 +111,13 @@ public class MicService extends Service {
             byte[] pcm = new byte[4096];
             while (running) {
                 int n = record.read(pcm, 0, pcm.length);
-                if (n <= 0) continue;
+                if (n < 0) {
+                    // 读取错误（麦克风被占用/初始化失败）：睡眠降频，避免空转烧 CPU
+                    if (!running) break;
+                    try { Thread.sleep(50); } catch (InterruptedException e) { break; }
+                    continue;
+                }
+                if (n == 0) continue;
                 // 数字增益（16bit 小端，两字节一个采样），带削波保护 + 电平统计
                 float g = (float) Math.pow(10, GAIN_DB / 20.0);
                 int peak = 0, clippedNow = 0;
@@ -141,13 +163,15 @@ public class MicService extends Service {
                     // 端口被占，试下一个
                 }
             }
-            if (ss == null) {   // 全部被占：如实汇报
+            if (ss == null) {   // 全部被占：如实汇报并结束服务（避免残留空转的前台通知）
                 RUNNING = false;
                 running = false;
+                stopSelf();
                 return;
             }
             serverSocket = ss;
             registerNsd(PORT_BOUND);
+            startUdpChannel();
             try {
                 while (running) {
                     final Socket s = ss.accept();
@@ -157,6 +181,65 @@ public class MicService extends Service {
             }
         }, "server");
         serverThread.start();
+    }
+
+    /**
+     * UDP 直连通道（mDNS 失效时的兜底发现）：
+     * 1) 无客户端连接时每秒广播公告 → 电脑回网后秒级自动重连；
+     * 2) 收到电脑 "PHONEMIC_QUERY" 查询立即回公告 → 菜单「立即重连」秒连。
+     * （实测：亮屏/息屏均持续广播，前台服务保活了网络栈）
+     */
+    private void startUdpChannel() {
+        new Thread(() -> {
+            java.net.DatagramSocket ds = null;
+            try {
+                ds = new java.net.DatagramSocket(QUERY_PORT);
+                ds.setSoTimeout(1000);
+                byte[] buf = new byte[64];
+                while (running) {
+                    try {
+                        if (clients.isEmpty() && PORT_BOUND > 0) {
+                            byte[] ann = ("PHONEMIC " + PORT_BOUND).getBytes("US-ASCII");
+                            ds.send(new java.net.DatagramPacket(ann, ann.length,
+                                    java.net.InetAddress.getByName("255.255.255.255"),
+                                    ANNOUNCE_PORT));
+                        }
+                    } catch (Exception ignored) {}
+                    try {
+                        java.net.DatagramPacket p = new java.net.DatagramPacket(buf, buf.length);
+                        ds.receive(p);
+                        String msg = new String(p.getData(), 0, p.getLength()).trim();
+                        if ("PHONEMIC_QUERY".equals(msg) && PORT_BOUND > 0) {
+                            byte[] ann = ("PHONEMIC " + PORT_BOUND).getBytes("US-ASCII");
+                            ds.send(new java.net.DatagramPacket(ann, ann.length,
+                                    p.getAddress(), ANNOUNCE_PORT));
+                        }
+                    } catch (java.net.SocketTimeoutException ignored) {
+                    } catch (Exception ignored) {}
+                }
+            } catch (Exception ignored) {
+            } finally {
+                try { if (ds != null) ds.close(); } catch (Exception ignored) {}
+            }
+        }, "udp").start();
+    }
+
+    /** 手动触发：立即连发 3 个公告（主界面「通知电脑」按钮），服务未运行时无效。 */
+    public static void announceNow() {
+        if (PORT_BOUND <= 0) return;
+        new Thread(() -> {
+            try {
+                java.net.DatagramSocket ds = new java.net.DatagramSocket();
+                ds.setBroadcast(true);
+                byte[] ann = ("PHONEMIC " + PORT_BOUND).getBytes("US-ASCII");
+                for (int i = 0; i < 3; i++) {
+                    ds.send(new java.net.DatagramPacket(ann, ann.length,
+                            java.net.InetAddress.getByName("255.255.255.255"), ANNOUNCE_PORT));
+                    Thread.sleep(150);
+                }
+                ds.close();
+            } catch (Exception ignored) {}
+        }).start();
     }
 
     private NsdManager.RegistrationListener nsdListener;
@@ -194,6 +277,7 @@ public class MicService extends Service {
         OutputStream out = null;
         try {
             s.setTcpNoDelay(true);
+            s.setSoTimeout(10000);   // 握手超时：不发请求的连接不会永久占住线程
             InputStream in = s.getInputStream();
             int state = 0, b;
             while (state < 4 && (b = in.read()) != -1) {   // 吃掉 HTTP 请求头（到 \r\n\r\n）
@@ -201,6 +285,7 @@ public class MicService extends Service {
                 else if (b == '\n') state = (state == 1 || state == 3) ? state + 1 : 0;
                 else state = 0;
             }
+            s.setSoTimeout(0);       // 流式传输阶段不限时
             out = s.getOutputStream();
             out.write("HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nConnection: close\r\n\r\n"
                     .getBytes("ISO-8859-1"));
