@@ -8,6 +8,7 @@ import threading
 import time
 from pathlib import Path
 
+import media_ducking
 import rumps
 
 BASE = Path.home() / "LocalStorage" / "GitHub" / "PhoneMic"
@@ -20,6 +21,7 @@ GAIN_FILE = BASE / "gain_db"
 LEVEL_FILE = BASE / ".level"
 DENOISE_FILE = BASE / "denoise"
 RECORD_FILE = BASE / "record"
+DUCK_FILE = BASE / "auto_duck"           # 录音期间自动暂停/恢复背景音（默认开启 "1"）
 PTT_FILE = BASE / ".ptt"                 # 右 Option 按住状态（引擎读取，PTT 录音）
 REC_DIR = BASE / "recordings"
 RECONNECT_FILE = BASE / ".reconnect"     # 「立即重连」信号（引擎等待循环轮询消费）
@@ -197,12 +199,17 @@ class PhoneMicMenu(rumps.App):
         self.should_run = False
         self.status = "stopped"
         self.level_hist = []
+        self.ducker = media_ducking.AudioDucker(
+            enabled_getter=lambda: self._flag_on(DUCK_FILE, default=1) == 1
+        )
         self.item_status = rumps.MenuItem(TEXTS["stopped"], callback=None)
         self.item_toggle = rumps.MenuItem("启动", callback=self.on_toggle)
         self.item_denoise = rumps.MenuItem("降噪：过滤电脑风扇声", callback=self.on_denoise)
         self.item_denoise.state = self._flag_on(DENOISE_FILE)
         self.item_rec = rumps.MenuItem("录音存档（单击右⌥开始/再单击结束）", callback=self.on_record)
         self.item_rec.state = self._flag_on(RECORD_FILE)
+        self.item_duck = rumps.MenuItem("录音时自动暂停背景音（防串音）", callback=self.on_duck)
+        self.item_duck.state = self._flag_on(DUCK_FILE, default=1)
         self.item_ptt = rumps.MenuItem("PTT 监听：等待权限…", callback=None)
         self.ptt_error = None
         self.ptt_mode = None
@@ -224,7 +231,7 @@ class PhoneMicMenu(rumps.App):
         self.menu = [self.item_status, None,
                      ["输出增益（电脑侧微调）", gain_items], None,
                      self.item_ptt,
-                     self.item_denoise, self.item_rec, self.item_open_rec,
+                     self.item_duck, self.item_denoise, self.item_rec, self.item_open_rec,
                      self.item_sys, self.item_reconnect,
                      self.item_toggle, self.item_autostart, None]
         self.sync_gain_state()
@@ -234,8 +241,7 @@ class PhoneMicMenu(rumps.App):
         except Exception:
             pass
         start_ptt_listener(
-            on_state=lambda active: (setattr(self, "ptt_active", active),
-                                     _write_ptt(active)),
+            on_state=self._on_ptt_state_changed,
             on_error=lambda msg: setattr(self, "ptt_error", msg),
             on_mode=lambda m: setattr(self, "ptt_mode", m),
         )
@@ -254,11 +260,13 @@ class PhoneMicMenu(rumps.App):
     # ---------- 工具 ----------
 
     @staticmethod
-    def _flag_on(path: Path) -> int:
+    def _flag_on(path: Path, default: int = 0) -> int:
         try:
-            return 1 if (path.exists() and path.read_text().strip() == "1") else 0
+            if not path.exists():
+                return default
+            return 1 if path.read_text().strip() == "1" else 0
         except Exception:
-            return 0
+            return default
 
     # ---------- 引擎管理 ----------
 
@@ -332,16 +340,37 @@ class PhoneMicMenu(rumps.App):
                 except Exception:
                     pass
 
+    def _on_ptt_state_changed(self, active: bool):
+        """右 Option 切换：同步更新 PTT 状态，并自动暂停/恢复背景音。"""
+        self.ptt_active = active
+        _write_ptt(active)
+        if active:
+            self.ducker.duck()
+        else:
+            self.ducker.unduck()
+
     # ---------- 菜单动作 ----------
 
     def on_toggle(self, sender):
         if self.should_run:
             self.should_run = False
+            if self.ducker.is_ducked:
+                self.ducker.unduck()
             self._stop_engines()
             self.status = "stopped"
         else:
             self.spawn()
         self.refresh()
+
+    def on_duck(self, sender):
+        new_state = not self._flag_on(DUCK_FILE, default=1)
+        try:
+            DUCK_FILE.write_text("1" if new_state else "0")
+            sender.state = 1 if new_state else 0
+        except Exception:
+            pass
+        if not new_state and self.ducker.is_ducked:
+            self.ducker.unduck()
 
     def on_gain(self, sender):
         try:
@@ -542,7 +571,11 @@ class PhoneMicMenu(rumps.App):
 
 
     def quit(self, sender=None):
-        """退出前归还原系统输入设备并停掉引擎，避免留下哑麦状态和孤儿引擎进程。"""
+        """退出前归还原系统输入设备与静音状态并停掉引擎，避免留下哑麦状态和孤儿引擎进程。"""
+        try:
+            self.ducker.cleanup()
+        except Exception:
+            pass
         if self._sys_switched:
             self._restore_sys_input()
         self.should_run = False
@@ -551,6 +584,7 @@ class PhoneMicMenu(rumps.App):
 
 
 if __name__ == "__main__":
+    import atexit
     import fcntl
     import os
     _lock_fh = open(str(BASE / ".menu_lock"), "w")
@@ -563,6 +597,7 @@ if __name__ == "__main__":
     _lock_fh.flush()
 
     app = PhoneMicMenu()
+    atexit.register(app.ducker.cleanup)
 
     def ticker(_):
         app.refresh()

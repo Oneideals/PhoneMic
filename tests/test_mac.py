@@ -351,11 +351,63 @@ def test_udp_reconnect():
         pass
 
 
+def test_media_ducking():
+    """音频避让与媒体控制测试：CoreAudio 静音、AudioDucker 状态转移与异常安全。"""
+    import media_ducking
+
+    # 5a. CoreAudio 静音获取与设置
+    orig_mute = media_ducking.get_system_mute()
+    try:
+        # 设置静音
+        ok_mute = media_ducking.set_system_mute(True)
+        check("音频避让: set_system_mute(True)", ok_mute and media_ducking.get_system_mute() is True)
+
+        # 解除静音
+        ok_unmute = media_ducking.set_system_mute(False)
+        check("音频避让: set_system_mute(False)", ok_unmute and media_ducking.get_system_mute() is False)
+    finally:
+        media_ducking.set_system_mute(orig_mute)
+
+    # 5b. AudioDucker 状态流转与静音自动恢复
+    # 模拟未静音环境下的 duck 与 unduck
+    media_ducking.set_system_mute(False)
+    ducker = media_ducking.AudioDucker(enabled_getter=lambda: True)
+    ducker.duck()
+    check("音频避让: duck 后 is_ducked 为 True 且系统静音",
+          ducker.is_ducked and media_ducking.get_system_mute() is True)
+
+    ducker.unduck()
+    check("音频避让: unduck 后 is_ducked 为 False 且系统解除静音",
+          not ducker.is_ducked and media_ducking.get_system_mute() is False)
+
+    # 5c. 用户原本就静音时：duck 不会破坏用户的静音意图，unduck 不会把用户取消静音
+    media_ducking.set_system_mute(True)
+    ducker2 = media_ducking.AudioDucker(enabled_getter=lambda: True)
+    ducker2.duck()
+    check("音频避让: 原本已静音时 did_mute_system 标记为 False", not ducker2._did_mute_system)
+    ducker2.unduck()
+    check("音频避让: 原本已静音时 unduck 保持静音", media_ducking.get_system_mute() is True)
+    media_ducking.set_system_mute(orig_mute)
+
+    # 5d. 开关禁用时：duck 不生效
+    ducker3 = media_ducking.AudioDucker(enabled_getter=lambda: False)
+    media_ducking.set_system_mute(False)
+    ducker3.duck()
+    check("音频避让: 禁用开关时 duck() 不改变系统静音",
+          not ducker3.is_ducked and media_ducking.get_system_mute() is False)
+    media_ducking.set_system_mute(orig_mute)
+
+    # 5e. MediaRemote 查询无崩溃
+    mr_playing = media_ducking.check_media_remote_playing(timeout=0.05)
+    check("音频避让: MediaRemote.framework isPlaying 安全调用", isinstance(mr_playing, bool))
+
+
 if __name__ == "__main__":
     test_wav_header()
     test_lock()
     test_stream_and_sigterm()
     test_udp_reconnect()
+    test_media_ducking()
     print(f"\n结果: {len(PASS)} 通过 / {len(FAIL)} 失败")
     if FAIL:
         print("失败项:", FAIL)
