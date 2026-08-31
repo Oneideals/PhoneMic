@@ -1,6 +1,9 @@
-# PhoneMic — 把安卓手机变成 Mac 的专业麦克风
+# PhoneMic — 把安卓手机变成 Mac 的专业无线麦克风
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![CI](https://github.com/Oneideals/PhoneMic/actions/workflows/ci.yml/badge.svg)](https://github.com/Oneideals/PhoneMic/actions/workflows/ci.yml)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Android 8.0+](https://img.shields.io/badge/Android-8.0+-green.svg)](https://developer.android.com)
 
 用一部安卓手机 + 一台 Mac，搭建一条**低延迟、可自愈、可存档**的无线麦克风链路，
 专为语音输入（微信输入法语音转文字等 ASR 场景）优化信号质量。
@@ -39,79 +42,85 @@ Mac（phonemic.py 引擎：拉流 → 降噪 afftdn → 增益 → 写入 BlackH
 - **Mac 端**：macOS 12+；Python 3.10+；[BlackHole 2ch](https://github.com/ExistentialAudio/BlackHole) 虚拟声卡；[ffmpeg](https://ffmpeg.org)（降噪与 FLAC 转码，可选但推荐）；[SwitchAudioSource](https://github.com/deweller/switchaudio-osx)（系统输入接管，可选）
 - **安卓端**：Android 8.0+（API 26+），无需 Google Play
 
-## 安装
+## 快速安装
 
-### Mac 端
+### 1. Mac 端配置
 
 ```bash
+# 克隆仓库
 git clone https://github.com/Oneideals/PhoneMic.git
 cd PhoneMic
+
+# 安装 Python 虚拟环境与依赖
 python3 -m venv .venv
 source .venv/bin/activate
-pip install sounddevice numpy zeroconf rumps
+pip install -r requirements.txt
+
+# 安装系统级依赖
 brew install blackhole-2ch ffmpeg
-# 可选：系统输入一键接管需要
+
+# 可选：系统输入一键接管工具
 brew install switchaudio-osx
 ```
 
-启动：
+启动菜单栏管理应用：
 
 ```bash
-./PhoneMic.command        # 双击也行：若已在运行不会重复启动
-# 或
+./PhoneMic.command        # 双击即可启动（后台守护，防重复拉起）
+# 或手动运行
 python PhoneMicMenu.py
 ```
 
 菜单栏出现状态圆点后即就绪。
 
-### 安卓端
+### 2. 安卓端安装
 
-用 Android Studio 打开本仓库的 `android/` 目录，构建并安装 `app` 模块到手机（Minimum SDK 26）。
-或自行用 Gradle 构建 APK 后侧载。
+- **直接下载**：前往 [Releases 页面](https://github.com/Oneideals/PhoneMic/releases) 下载最新预编译 `PhoneMic-v*.apk` 并安装到手机。
+- **源码构建**：
+  ```bash
+  cd android
+  ./gradlew assembleDebug
+  # 构建产物位于 android/app/build/outputs/apk/debug/app-debug.apk
+  ```
+  或使用 Android Studio 直接打开 `android/` 项目构建安装。
 
-> 也可从 Release 页下载预编译 APK（若提供）。
+## 使用说明
 
-## 使用
-
-1. 手机端启动 PhoneMic 服务（或下拉快捷磁贴一键启停）
-2. Mac 端菜单栏应自动发现手机并显示白点；连通后保持稳定
+1. 手机端启动 PhoneMic 服务（或下拉通知栏快捷磁贴一键启停）
+2. Mac 端菜单栏自动发现手机并显示白点；连通后保持稳定
 3. 在需要麦克风的应用里，把输入设备选成 **BlackHole 2ch**
-   - 跟随系统默认的 App：开启菜单栏「接管系统输入」即可自动切换
-   - 自管设备的 App（Zoom / 腾讯会议 / OBS 等）：在它们的音频设置里手动选一次 BlackHole 2ch，之后会记住
-4. 说话即可；菜单栏图标绿点表示正在录音存档
+   - **跟随系统默认的 App**：开启菜单栏「接管系统输入」即可自动切换
+   - **自管设备的 App**（Zoom / 腾讯会议 / 微信 / OBS 等）：在设置中手动选择一次 BlackHole 2ch
+4. 说话即可开始语音输入；菜单栏图标绿点表示正在录音存档
 
 ## 工作原理
 
-1. 手机通过 `AudioRecord` 采集麦克风，做增益与 NoiseSuppressor 降噪，再以无限长 WAV 的 HTTP 流推送。
-2. Mac 端引擎 `phonemic.py` 拉流，经 ffmpeg `afftdn` 二次降噪与数字增益，写入 BlackHole 虚拟声卡。
-3. BlackHole 是系统级音频输入设备，任何能选麦克风的 App 都能用它。
+1. **音频采集与服务端**：手机端通过 `AudioRecord` 以 48kHz/16bit/单声道采集，应用硬件 NoiseSuppressor 降噪与数字增益后，启动极轻量 HTTP 服务推送无限长 WAV 数据流。
+2. **零配置自动发现**：手机端通过 mDNS (`_phonemic._tcp.local.`) 和 UDP 广播 (`255.255.255.255:58080`) 发布服务地址，Mac 端三级自动发现与毫秒级故障自愈。
+3. **音频流水线**：Mac 端引擎 `phonemic.py` 拉流后经由 ffmpeg `afftdn` 稳态二次降噪与动态增益，实时写入 BlackHole 虚拟声卡供各应用低延迟消费。
 
-发现采用 mDNS + UDP 公告双通道；断流后引擎退避重试，手机回归即秒级重连。
+## 隐私与安全
 
-## 隐私
-
-- 所有音频**只在本机处理**，不连接任何外部服务器（仅需手机与 Mac 在同一局域网）。
-- 录音存档默认关闭；开启后数据仅保存在本机 `recordings/` 目录（已 gitignore），不会上传。
-- 仓库不含任何密钥、令牌或个人数据。
+- **纯局域网处理**：所有音频流仅在手机与 Mac 之间的局域网直连传输，绝不经过外部中转或云端。
+- **本地存储控制**：录音存档默认关闭；开启后的音频文件与指标仅存储在本机 `recordings/` 目录（已加入 `.gitignore`）。
+- **开源合规**：仓库不包含任何私有证书、密钥或隐私数据。
 
 ## 诊断日志（可选）
 
-引擎与菜单栏内置可选的调试日志，落盘到项目根目录的 `.debug.log`（已被 gitignore，不会入库），
-用于排查「断流 / 录不上」等问题。开销极低（约 165KB/小时），如不需要可删除 `debuglog.py` 及其两处 `import`。
+引擎与菜单栏内置轻量级调试日志（位于项目根目录 `.debug.log`，已被 `.gitignore` 忽略），开销约 165KB/小时：
 
 ```bash
 tail -f .debug.log
 ```
 
-## 开发
+## 开发者指南
 
 ```bash
-# 运行 Mac 端集成测试（需要本机已装 BlackHole）
+# 运行 Mac 端集成测试（需已安装 BlackHole）
 python tests/test_mac.py
 ```
 
-提交请遵循仓库既有的结构化提交规范（见 `git log` 历史：含「核心问题诊断」「Release Notes」「变更模块」等分段）。
-建议先从 Issue 讨论入手。
+欢迎提交 PR 或 Issue！提交代码前请参考 [CONTRIBUTING.md](CONTRIBUTING.md) 与 [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)。
 
 ## 许可证
 

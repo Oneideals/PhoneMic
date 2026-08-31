@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "phonemic"
+version = "1.0.0"
+description = "把安卓手机变成 Mac 的低延迟、可自愈无线麦克风 / Low-latency wireless microphone streaming from Android to macOS"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Oneideals" }
+]
+keywords = [
+    "microphone",
+    "audio",
+    "android",
+    "macos",
+    "blackhole",
+    "asr",
+    "streaming"
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: MacOS X",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Sound/Audio :: Capture/Recording",
+]
+dependencies = [
+    "sounddevice>=0.4.6",
+    "numpy>=1.24.0",
+    "zeroconf>=0.131.0",
+    "rumps>=0.4.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Oneideals/PhoneMic"
+Repository = "https://github.com/Oneideals/PhoneMic.git"
+Issues = "https://github.com/Oneideals/PhoneMic/issues"
