@@ -46,6 +46,8 @@ public class MicService extends Service {
     private android.media.audiofx.NoiseSuppressor ns;
     private volatile boolean running;
     private ServerSocket serverSocket;
+    private android.os.PowerManager.WakeLock wakeLock;
+    private android.net.wifi.WifiManager.WifiLock wifiLock;
 
     @Override public IBinder onBind(Intent intent) { return null; }
 
@@ -62,6 +64,8 @@ public class MicService extends Service {
         RUNNING = false;
         PORT_BOUND = -1;
         unregisterNsd();
+        try { if (wakeLock != null && wakeLock.isHeld()) wakeLock.release(); } catch (Exception ignored) {}
+        try { if (wifiLock != null && wifiLock.isHeld()) wifiLock.release(); } catch (Exception ignored) {}
         try { if (record != null) { record.stop(); record.release(); } } catch (Exception ignored) {}
         try { if (ns != null) ns.release(); } catch (Exception ignored) {}
         try { if (serverSocket != null) serverSocket.close(); } catch (Exception ignored) {}
@@ -75,6 +79,30 @@ public class MicService extends Service {
         running = true;
         RUNNING = true;
         android.util.Log.d("PhoneMic.Svc", "startInternal: 服务启动");
+        try {
+            android.os.PowerManager pm = (android.os.PowerManager) getSystemService(POWER_SERVICE);
+            if (pm != null) {
+                wakeLock = pm.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "PhoneMic:WakeLock");
+                wakeLock.acquire();
+            }
+        } catch (Exception e) {
+            android.util.Log.w("PhoneMic.Svc", "获取 WakeLock 失败: " + e);
+        }
+
+        try {
+            android.net.wifi.WifiManager wm = (android.net.wifi.WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
+            if (wm != null) {
+                int mode = android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF;
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                    mode = android.net.wifi.WifiManager.WIFI_MODE_FULL_LOW_LATENCY;
+                }
+                wifiLock = wm.createWifiLock(mode, "PhoneMic:WifiLock");
+                wifiLock.acquire();
+            }
+        } catch (Exception e) {
+            android.util.Log.w("PhoneMic.Svc", "获取 WifiLock 失败: " + e);
+        }
+
         try {
             android.content.SharedPreferences sp =
                     getSharedPreferences("phonemic", MODE_PRIVATE);

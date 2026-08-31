@@ -387,6 +387,16 @@ class PhoneMicMenu(rumps.App):
                              f"，引擎={'在跑' if self.proc and self.proc.poll() is None else '未运行'}"
                              f"，状态={self.status}）")
         if active:
+            if self.status != "streaming":
+                try:
+                    import AppKit
+                    AppKit.NSBeep()
+                except Exception:
+                    pass
+                try:
+                    rumps.notification("PhoneMic", "手机麦克风未连通", "当前正在寻找手机，请检查手机服务是否开启")
+                except Exception:
+                    pass
             self.ducker.duck()
         else:
             self.ducker.unduck()

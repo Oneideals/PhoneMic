@@ -559,7 +559,8 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
     frame_bytes = ch * bits // 8
     byte_rate = rate * frame_bytes
     stat = {"underruns": 0, "bytes": 0}
-    q: queue.Queue = queue.Queue(maxsize=max(4, byte_rate // 4096))
+    # 队列容量提升至 3 秒（约 70 个 chunk），平滑 Wi-Fi 突发抖动，防止中间丢字
+    q: queue.Queue = queue.Queue(maxsize=max(8, (byte_rate * 3) // 4096))
     # 心跳：记录"最后一次收到数据"与"最后一次回调被声卡驱动调用"的时刻，
     # 用于区分「手机没送数据」与「声卡回调卡死/系统睡眠唤醒后未恢复」
     hb = {"data": time.time(), "cb": time.time(), "cb_count": 0,
