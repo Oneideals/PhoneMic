@@ -1,5 +1,5 @@
-# PhoneMic Mac 端依赖
+# PhoneMic 依赖清单
 sounddevice>=0.4.6
 numpy>=1.24.0
 zeroconf>=0.131.0
-rumps>=0.4.0
+rumps>=0.4.0; sys_platform == 'darwin'
