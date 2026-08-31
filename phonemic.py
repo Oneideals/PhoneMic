@@ -619,6 +619,15 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
         del rem[:need]
         if dtype == "int16":
             arr = np.frombuffer(data, dtype=dtype).astype(np.float32) * (10 ** (GAIN_DB["v"] / 20.0))
+            # 平滑软限幅器（Soft Limiter）：阈值 26000（约 -2dBFS），超过部分采用 tanh 平滑压缩，杜绝方波爆音与削波失真
+            threshold = 26000.0
+            limit = 32000.0
+            mask = np.abs(arr) > threshold
+            if np.any(mask):
+                excess = np.abs(arr[mask]) - threshold
+                max_excess = 32767.0 - threshold
+                compressed = threshold + (limit - threshold) * np.tanh(excess / (max_excess * 0.8))
+                arr[mask] = np.sign(arr[mask]) * compressed
             np.clip(arr, -32768, 32767, out=arr)
             stat["clipped"] = stat.get("clipped", 0) + int(np.count_nonzero(np.abs(arr) >= 32600))
             peak = int(np.abs(arr).max()) * 100 // 32768
