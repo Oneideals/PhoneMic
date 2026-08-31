@@ -527,7 +527,7 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
             ff = subprocess.Popen(
                 ["ffmpeg", "-hide_banner", "-loglevel", "error",
                  "-f", "s16le", "-ar", str(rate), "-ac", "1", "-i", "pipe:0",
-                 "-af", "afftdn=nr=14:nf=-40:tn=1",
+                 "-af", "highpass=f=80,afftdn=nr=8:nf=-60:tn=0",
                  "-f", "s16le", "-ar", str(rate), "-ac", "1", "pipe:1"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE)
 
