@@ -29,7 +29,7 @@ public class MainActivity extends Activity {
     private static final String KEY_GAIN = "gain_db";
 
     private MaterialButton btnToggle, gainDown, gainUp, btnNotify;
-    private TextView statusText, levelText, peakText, gainLabel, addrText;
+    private TextView statusText, modeStatusText, modeDetailText, levelText, peakText, gainLabel, addrText;
     private LinearProgressIndicator levelBar;
     private final Handler ticker = new Handler();
     private final Runnable tick = new Runnable() {
@@ -102,8 +102,19 @@ public class MainActivity extends Activity {
         statusText = label("○ 服务未启动", 15, onSurfVar, 12);
         root.addView(statusText);
 
+        // ── 传输链路模式卡 ──
+        MaterialCardView modeCard = card(4);
+        LinearLayout md = innerOf(modeCard);
+        md.addView(label("当前连接链路", 13, onSurfVar, 4));
+        modeStatusText = label("⏸ 待机中（等待电脑连接）", 16, onSurface, 3);
+        modeStatusText.setTypeface(null, android.graphics.Typeface.BOLD);
+        md.addView(modeStatusText);
+        modeDetailText = label("支持 USB 直连与 UDP 无线自动切换", 12, onSurfVar, 0);
+        md.addView(modeDetailText);
+        root.addView(modeCard);
+
         // ── 电平卡 ──
-        MaterialCardView levelCard = card(4);
+        MaterialCardView levelCard = card(14);
         LinearLayout lv = innerOf(levelCard);
         lv.addView(label("输入电平", 14, onSurfVar, 10));
         levelBar = new LinearProgressIndicator(this);
@@ -267,11 +278,21 @@ public class MainActivity extends Activity {
                 com.google.android.material.R.attr.colorOnPrimary);
 
         if (running) {
-            statusText.setText("● 服务运行中 · 局域网内电脑可自动发现");
+            statusText.setText("● 麦克风服务运行中");
             statusText.setTextColor(primary);
         } else {
             statusText.setText("○ 服务未启动");
             statusText.setTextColor(onSurfVar);
+        }
+
+        modeStatusText.setText(MicService.getActiveLinkMode());
+        modeDetailText.setText(MicService.getActiveLinkDetail());
+        if (MicService.HAS_USB_LINK) {
+            modeStatusText.setTextColor(Color.parseColor("#10B981"));
+        } else if (!running) {
+            modeStatusText.setTextColor(onSurfVar);
+        } else {
+            modeStatusText.setTextColor(primary);
         }
 
         int lv = running ? MicService.LEVEL : 0;

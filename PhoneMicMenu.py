@@ -241,6 +241,8 @@ class PhoneMicMenu(rumps.App):
             enabled_getter=lambda: self._flag_on(DUCK_FILE, default=1) == 1
         )
         self.item_status = rumps.MenuItem(TEXTS["stopped"], callback=None)
+        self.item_mode = rumps.MenuItem("传输链路：🔍 检测中…", callback=None)
+        self.item_level = rumps.MenuItem("电平诊断：--", callback=None)
         self.item_toggle = rumps.MenuItem("启动", callback=self.on_toggle)
         self.item_denoise = rumps.MenuItem("降噪：过滤电脑风扇声", callback=self.on_denoise)
         self.item_denoise.state = self._flag_on(DENOISE_FILE)
@@ -267,12 +269,18 @@ class PhoneMicMenu(rumps.App):
             it._db = db
             gain_items.append(it)
         self.gain_items = gain_items
-        self.menu = [self.item_status, None,
-                     ["输出增益（电脑侧微调）", gain_items], None,
-                     self.item_ptt,
-                     self.item_duck, self.item_denoise, self.item_rec, self.item_open_rec,
-                     self.item_sys, self.item_reconnect,
-                     self.item_toggle, self.item_autostart, None]
+        self.menu = [
+            self.item_status,
+            self.item_mode,
+            self.item_level,
+            None,
+            ["输出增益（电脑侧微调）", gain_items],
+            None,
+            self.item_ptt,
+            self.item_duck, self.item_denoise, self.item_rec, self.item_open_rec,
+            self.item_sys, self.item_reconnect,
+            self.item_toggle, self.item_autostart, None
+        ]
         self.sync_gain_state()
         # PTT：单击右 Option 切换录音开关，状态写 .ptt 供引擎读取
         try:
@@ -608,7 +616,9 @@ class PhoneMicMenu(rumps.App):
 
         if not self.should_run:
             self.icon = self.paths["stopped"]
-            status_text = TEXTS["stopped"]
+            self.item_status.title = "○ PhoneMic 已停止"
+            self.item_mode.title = "传输链路：⏸ 已停止"
+            self.item_level.title = "电平诊断：--"
         elif self.status == "streaming":
             live = self.recording_on() and self.ptt_active   # 录音开启且开关激活才录
             self.icon = self.paths["recording" if live else "on"]
@@ -619,17 +629,14 @@ class PhoneMicMenu(rumps.App):
             except Exception:
                 pass
             if "127.0.0.1" in last_url:
-                mode_tag = "⚡ USB直连 <1ms"
+                mode_tag = "⚡ USB 物理直连 (<1ms 极速)"
             elif last_url.startswith("udp://"):
-                mode_tag = "📡 UDP无线 15ms"
+                mode_tag = "📡 UDP 极速无线流 (15ms 低延迟)"
             else:
-                mode_tag = "📶 Wi-Fi无线"
-            status_text = f"● 手机麦克风已连通 ({mode_tag})" + ("（🎤录音中）" if live else "")
-        else:
-            self.icon = self.paths["connecting"]
-            status_text = TEXTS["connecting"]
+                mode_tag = "📶 Wi-Fi 局域网流 (40ms)"
+            self.item_status.title = "● 手机麦克风已连通" + ("（🎤录音中）" if live else "")
+            self.item_mode.title = f"传输链路：{mode_tag}"
 
-        if self.status == "streaming":
             try:
                 lv = int(LEVEL_FILE.read_text().strip() or 0)
             except Exception:
@@ -645,20 +652,21 @@ class PhoneMicMenu(rumps.App):
             except Exception:
                 pass
             if wmax < 8:
-                verdict = "静音或未说话（对着手机说一句试试）"
+                verdict = "静音或未说话"
             elif wmax < 15:
-                verdict = f"峰值 {wmax}% 偏小 → 建议加增益（手机＋3dB 或本菜单选高档）"
+                verdict = f"峰值 {wmax}% 偏小（可＋3dB）"
             elif wmax <= 90:
-                verdict = f"峰值 {wmax}% ✓ 合适，保持即可"
+                verdict = f"峰值 {wmax}% ✓ 良好"
             elif cur_gain > 0:
-                verdict = f"峰值 {wmax}% 过大 → 建议降增益（有削波风险）"
+                verdict = f"峰值 {wmax}% 过大（建议降增益）"
             else:
-                # 两端增益均已 0dB：削波发生在手机麦克风采集端，数字增益无法挽救，
-                # 只能声学手段（录音数据实测结论）
-                verdict = f"峰值 {wmax}% 过大：麦克风本体过载 → 手机放远些或离嘴远一点"
-            self.item_status.title = "电平诊断: " + verdict
+                verdict = f"峰值 {wmax}% 过大（离嘴远一点）"
+            self.item_level.title = f"电平诊断：实时 {lv}% · 峰值 {wmax}% ({verdict})"
         else:
-            self.item_status.title = status_text
+            self.icon = self.paths["connecting"]
+            self.item_status.title = "◐ 正在寻找手机…"
+            self.item_mode.title = "传输链路：🔍 正在探测 USB / UDP / Wi-Fi…"
+            self.item_level.title = "电平诊断：--"
         self.item_toggle.title = "停止" if self.should_run else "启动"
 
         # 每分钟一次状态快照：便于把"某时刻的现象"和日志时间线对齐

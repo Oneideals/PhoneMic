@@ -248,8 +248,8 @@ def find_adb_path() -> str | None:
     return None
 
 
-def check_usb_device() -> str | None:
-    """检测是否有通过 USB 物理连接的 Android 手机，并自动建立极速端口映射。"""
+def check_usb_device(auto_wake: bool = True) -> str | None:
+    """检测是否有通过 USB 物理连接的 Android 手机，并自动建立极速端口映射与自启动。"""
     adb = find_adb_path()
     if not adb:
         return None
@@ -260,11 +260,25 @@ def check_usb_device() -> str | None:
             parts = line.split()
             if len(parts) >= 2 and parts[1] == "device" and not parts[0].startswith("emulator"):
                 dev_id = parts[0]
-                # 端口映射：把手机的 8080 端口转发到本地 58083
-                subprocess.run([adb, "-s", dev_id, "forward", "tcp:58083", "tcp:8080"],
-                               capture_output=True, timeout=1.0)
-                if probe_ok("http://127.0.0.1:58083"):
-                    return "http://127.0.0.1:58083"
+                # 遍历手机可能的候选监听端口
+                for port in [8080, 8081, 18080, 28080]:
+                    subprocess.run([adb, "-s", dev_id, "forward", "tcp:58083", f"tcp:{port}"],
+                                   capture_output=True, timeout=0.5)
+                    if probe_ok("http://127.0.0.1:58083"):
+                        return "http://127.0.0.1:58083"
+
+                # 手机在线但服务未启动时，尝试通过 ADB 自动唤醒 PhoneMic 服务
+                if auto_wake:
+                    debuglog.log("engine", "检测到 USB 设备在线但服务未响应，尝试通过 ADB 自动拉起 PhoneMic")
+                    subprocess.run([adb, "-s", dev_id, "shell", "am", "start", "-n",
+                                    "com.jerry.phonemic/.MainActivity"],
+                                   capture_output=True, timeout=1.0)
+                    time.sleep(0.4)
+                    for port in [8080, 8081, 18080, 28080]:
+                        subprocess.run([adb, "-s", dev_id, "forward", "tcp:58083", f"tcp:{port}"],
+                                       capture_output=True, timeout=0.5)
+                        if probe_ok("http://127.0.0.1:58083"):
+                            return "http://127.0.0.1:58083"
     except Exception:
         pass
     return None
