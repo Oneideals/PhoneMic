@@ -153,8 +153,6 @@ try:
     _mr = ctypes.CDLL(_mr_path)
     _mr.MRMediaRemoteSendCommand.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
     _mr.MRMediaRemoteSendCommand.restype = ctypes.c_bool
-    _mr.MRMediaRemoteGetNowPlayingApplicationIsPlaying.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-    _mr.MRMediaRemoteGetNowPlayingApplicationIsPlaying.restype = None
 except Exception:
     _mr = None
 
@@ -164,70 +162,11 @@ _kMRTogglePlayPause = 2
 _kMRStop = 3
 
 
-class _BlockDescriptor(ctypes.Structure):
-    _fields_ = [
-        ("reserved", ctypes.c_ulong),
-        ("size", ctypes.c_ulong),
-        ("copy_helper", ctypes.c_void_p),
-        ("dispose_helper", ctypes.c_void_p),
-        ("signature", ctypes.c_char_p),
-    ]
-
-
-class _BlockLiteral(ctypes.Structure):
-    pass
-
-
-_BlockInvoke = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_bool)
-
-_BlockLiteral._fields_ = [
-    ("isa", ctypes.c_void_p),
-    ("flags", ctypes.c_int32),
-    ("reserved", ctypes.c_int32),
-    ("invoke", _BlockInvoke),
-    ("descriptor", ctypes.POINTER(_BlockDescriptor)),
-]
-
-_descriptor = _BlockDescriptor()
-_descriptor.reserved = 0
-_descriptor.size = ctypes.sizeof(_BlockLiteral)
-_descriptor.copy_helper = None
-_descriptor.dispose_helper = None
-_descriptor.signature = b"v12@?0B8"
-
-
 def check_media_remote_playing(timeout: float = 0.08) -> bool:
-    """查询 macOS MediaRemote (Now Playing) 当前是否正在播放音频/视频。"""
-    if not _mr:
-        return False
+    """查询 macOS 当前是否正在播放音频/视频（安全无崩溃检测）。"""
     try:
-        system_lib = ctypes.CDLL(ctypes.util.find_library("System"))
-        _NSConcreteGlobalBlock = ctypes.c_void_p.in_dll(system_lib, "_NSConcreteGlobalBlock")
-
-        is_playing_val = [False]
-        done_event = threading.Event()
-
-        def block_fn(block_ptr, is_playing):
-            is_playing_val[0] = bool(is_playing)
-            done_event.set()
-
-        c_block_fn = _BlockInvoke(block_fn)
-
-        block = _BlockLiteral()
-        block.isa = ctypes.addressof(_NSConcreteGlobalBlock)
-        block.flags = 0x50000000
-        block.reserved = 0
-        block.invoke = c_block_fn
-        block.descriptor = ctypes.pointer(_descriptor)
-
-        libdispatch = system_lib
-        libdispatch.dispatch_get_global_queue.argtypes = [ctypes.c_long, ctypes.c_ulong]
-        libdispatch.dispatch_get_global_queue.restype = ctypes.c_void_p
-        queue = libdispatch.dispatch_get_global_queue(0, 0)
-
-        _mr.MRMediaRemoteGetNowPlayingApplicationIsPlaying(queue, ctypes.byref(block))
-        done_event.wait(timeout=timeout)
-        return is_playing_val[0]
+        active = get_applescript_active_players()
+        return len(active) > 0
     except Exception:
         return False
 
