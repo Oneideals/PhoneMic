@@ -526,14 +526,17 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
         try:
             ff = subprocess.Popen(
                 ["ffmpeg", "-hide_banner", "-loglevel", "error",
+                 "-fflags", "nobuffer", "-flags", "low_delay",
+                 "-probesize", "32", "-analyzeduration", "0",
                  "-f", "s16le", "-ar", str(rate), "-ac", "1", "-i", "pipe:0",
                  "-af", "highpass=f=80,afftdn=nr=8:nf=-60:tn=0",
                  "-f", "s16le", "-ar", str(rate), "-ac", "1", "pipe:1"],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
 
             def feeder():
                 try:
-                    ff.stdin.write(payload)
+                    if payload:
+                        ff.stdin.write(payload)
                     while not stop.is_set():
                         chunk = resp.read(4096)
                         if not chunk:
@@ -559,8 +562,8 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
     frame_bytes = ch * bits // 8
     byte_rate = rate * frame_bytes
     stat = {"underruns": 0, "bytes": 0}
-    # 队列容量提升至 3 秒（约 70 个 chunk），平滑 Wi-Fi 突发抖动，防止中间丢字
-    q: queue.Queue = queue.Queue(maxsize=max(8, (byte_rate * 3) // 4096))
+    # 极低延迟队列：最大 3 个 chunk（约 128ms），平稳时维持在 1~2 个 chunk（42~85ms），杜绝语音滞后与截断
+    q: queue.Queue = queue.Queue(maxsize=3)
     # 心跳：记录"最后一次收到数据"与"最后一次回调被声卡驱动调用"的时刻，
     # 用于区分「手机没送数据」与「声卡回调卡死/系统睡眠唤醒后未恢复」
     hb = {"data": time.time(), "cb": time.time(), "cb_count": 0,
@@ -583,11 +586,16 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
                 try:
                     q.put_nowait(chunk)
                 except queue.Full:
+                    # 突发网络包到达时丢弃滞后旧帧，强制追平到当前实时时间（保持 <100ms 实时对齐）
+                    while q.qsize() > 1:
+                        try:
+                            q.get_nowait()
+                        except queue.Empty:
+                            break
                     try:
-                        q.get_nowait()   # 丢最旧的，保持低延迟
-                    except queue.Empty:
+                        q.put_nowait(chunk)
+                    except queue.Full:
                         pass
-                    q.put_nowait(chunk)
         except (TimeoutError, socket.timeout):
             if not stop.is_set():
                 print("\n[连接] 断开：3 秒无数据（手机离网或 Wi-Fi 中断）", flush=True)
