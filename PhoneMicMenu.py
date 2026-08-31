@@ -108,6 +108,25 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def _play_sound(sound_name: str = "Basso"):
+    try:
+        path = f"/System/Library/Sounds/{sound_name}.aiff"
+        if os.path.exists(path):
+            subprocess.Popen(["afplay", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def _show_notification(title: str, message: str, sound: str = None):
+    try:
+        script = f'display notification "{message}" with title "{title}"'
+        if sound:
+            script += f' sound name "{sound}"'
+        subprocess.Popen(["osascript", "-e", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
 def start_ptt_listener(on_state, on_error, on_mode=None):
     """监听右 Option：单击切换录音（微信语音输入式），非按住。
 
@@ -388,15 +407,9 @@ class PhoneMicMenu(rumps.App):
                              f"，状态={self.status}）")
         if active:
             if self.status != "streaming":
-                try:
-                    import AppKit
-                    AppKit.NSBeep()
-                except Exception:
-                    pass
-                try:
-                    rumps.notification("PhoneMic", "手机麦克风未连通", "当前正在寻找手机，请检查手机服务是否开启")
-                except Exception:
-                    pass
+                _play_sound("Basso")
+                _show_notification("PhoneMic 未连通", "手机麦克风未连通（正在寻找中），语音输入暂不可用", sound="Basso")
+                return
             self.ducker.duck()
         else:
             self.ducker.unduck()
@@ -578,6 +591,12 @@ class PhoneMicMenu(rumps.App):
         if self.status != self._last_logged_status:
             debuglog.log("menu", f"状态变迁：{self._last_logged_status} → {self.status}"
                                  f"（.level 新鲜={'是' if self.should_run and self.status == 'streaming' else '否'}）")
+            if self._last_logged_status == "streaming" and self.status == "connecting":
+                _play_sound("Sosumi")
+                _show_notification("PhoneMic 断开连接", "手机麦克风已断开，正在自动寻找重连…", sound="Sosumi")
+            elif self._last_logged_status in ("connecting", None) and self.status == "streaming" and self._last_logged_status is not None:
+                _play_sound("Glass")
+                _show_notification("PhoneMic 已连通", "手机麦克风已就绪，可按右⌥进行语音输入", sound="Glass")
             self._last_logged_status = self.status
 
         # 系统输入接管：连通即接管，断线/停止自动还原
