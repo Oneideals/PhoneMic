@@ -33,6 +33,8 @@ from pathlib import Path
 import numpy as np
 import sounddevice as sd
 
+import debuglog
+
 BASE = Path.home() / "LocalStorage" / "GitHub" / "PhoneMic"
 LAST_URL_FILE = BASE / ".phonemic_last_url"
 LOCK_FILE = BASE / ".phonemic_lock"
@@ -99,8 +101,10 @@ def acquire_lock() -> bool:
         fh.write(str(__import__("os").getpid()))
         fh.flush()
     except OSError:
+        debuglog.log("engine", "单实例锁已被占用，本次退出")
         return False
     _LOCK_FH = fh
+    debuglog.log("engine", f"拿到单实例锁 pid={__import__('os').getpid()}")
     return True
 
 
@@ -353,15 +357,19 @@ def save_flac(stamp: str) -> None:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         print(f"[录音] 保留 WAV：{wav_path.name}（未安装 ffmpeg）", flush=True)
+        debuglog.log("engine", f"转码跳过：未找到 ffmpeg，保留 {wav_path.name}")
         return
     try:
-        subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", str(wav_path),
-                        "-c:a", "flac", str(wav_path.with_suffix(".flac"))],
-                       check=True, capture_output=True)
+        r = subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", str(wav_path),
+                            "-c:a", "flac", str(wav_path.with_suffix(".flac"))],
+                           check=True, capture_output=True)
         wav_path.unlink()
         print(f"[录音] 已存档：{stamp}.flac", flush=True)
-    except Exception:
+        debuglog.log("engine", f"转码成功：{stamp}.flac（已删源 WAV）")
+    except Exception as e:
         print(f"[录音] 保留 WAV：{wav_path.name}（转码失败）", flush=True)
+        debuglog.log("engine", f"转码失败，保留 {wav_path.name}：{e}"
+                               + (f" | stderr={r.stderr[-300:]!r}" if 'r' in dir() else ""))
 
 
 class PttRecorder:
@@ -386,6 +394,8 @@ class PttRecorder:
                 on = PTT_FILE.exists() and PTT_FILE.read_text().strip() == "1"
             except Exception:
                 on = False
+            if on != self._cache[1]:     # 只在翻转时记一行，避免刷屏
+                debuglog.log("engine", f"PTT 开关 → {'开（开始录音）' if on else '关（收尾存档）'}")
             self._cache = (now, on)
         return self._cache[1]
 
@@ -402,8 +412,11 @@ class PttRecorder:
                     self.wav.setsampwidth(self.bits // 8)
                     self.wav.setframerate(self.rate)
                     print(f"[录音] 开始记录：{self.stamp}.wav", flush=True)
+                    debuglog.log("engine", f"录音开段：{self.stamp}.wav "
+                                           f"（{self.rate}Hz {self.ch}ch {self.bits}bit）")
                 except Exception as e:
                     print(f"[录音] 开段失败：{e}", flush=True)
+                    debuglog.log("engine", f"录音开段失败：{e}", exc=True)
                     self.wav = None
             if self.wav is not None:
                 try:
@@ -427,9 +440,11 @@ class PttRecorder:
             try:
                 (REC_DIR / f"{stamp}.wav").unlink()
                 print(f"[录音] 段过短（{dur:.1f}s），已丢弃", flush=True)
+                debuglog.log("engine", f"录音段过短丢弃：{stamp}（{dur:.1f}s）")
             except Exception:
                 pass
             return
+        debuglog.log("engine", f"录音段收尾：{stamp}.wav {dur:.1f}s，转入 FLAC 转码")
         t = threading.Thread(target=save_flac, args=(stamp,), daemon=True)
         self._savers.append(t)
         t.start()
@@ -489,9 +504,13 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
             meta_fh = open(REC_DIR / f"{rec_stamp}.meta.csv", "w")
             meta_fh.write("elapsed_sec,level_pct,underruns,clipped\n")
             print("[录音] PTT 模式：按右⌥开始记录，再按结束并存档 FLAC", flush=True)
+            debuglog.log("engine", f"录音器就绪：PTT 模式，指标文件 {rec_stamp}.meta.csv")
         except Exception as e:
             print(f"[录音] 启动失败：{e}", flush=True)
+            debuglog.log("engine", f"录音器启动失败：{e}", exc=True)
             recorder, meta_fh = None, None
+    else:
+        debuglog.log("engine", "录音存档未开启（record != 1）：PTT 期间不落盘")
     resp = StreamTee(resp, recorder, payload)
     payload = b""
 
@@ -541,6 +560,11 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
     byte_rate = rate * frame_bytes
     stat = {"underruns": 0, "bytes": 0}
     q: queue.Queue = queue.Queue(maxsize=max(4, byte_rate // 4096))
+    # 心跳：记录"最后一次收到数据"与"最后一次回调被声卡驱动调用"的时刻，
+    # 用于区分「手机没送数据」与「声卡回调卡死/系统睡眠唤醒后未恢复」
+    hb = {"data": time.time(), "cb": time.time(), "cb_count": 0,
+          "cb_started": False, "t_start": time.time(),
+          "src": "ffmpeg-pipe" if ff is not None else "http"}
 
     def producer():
         try:
@@ -549,6 +573,12 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
                 if not chunk:
                     raise ConnectionError("音频流结束")
                 stat["bytes"] += len(chunk)
+                now = time.time()
+                gap = now - hb["data"]
+                if gap > 2:   # 长时间无数据后恢复：记录一次，便于定位手机/Wi-Fi 抖动
+                    debuglog.log("engine", f"数据恢复：断流 {gap:.1f}s 后重新收到音频"
+                                           f"（源={hb['src']}）")
+                hb["data"] = now
                 try:
                     q.put_nowait(chunk)
                 except queue.Full:
@@ -560,13 +590,22 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
         except (TimeoutError, socket.timeout):
             if not stop.is_set():
                 print("\n[连接] 断开：3 秒无数据（手机离网或 Wi-Fi 中断）", flush=True)
+                debuglog.log("engine", "producer 读超时：3 秒无数据（手机离网/Wi-Fi 中断）")
         except Exception as e:
             if not stop.is_set():
                 print(f"\n[连接] 断开：{e}", flush=True)
+                debuglog.log("engine", f"producer 异常退出：{type(e).__name__}: {e}", exc=True)
 
     rem = bytearray()
 
     def callback(outdata, frames, _t, _status):
+        if not hb["cb_started"]:
+            hb["cb_started"] = True
+            debuglog.log("engine",
+                         f"声卡首次回调就位（距会话开始 "
+                         f"{time.time() - hb['t_start']:.1f}s）")
+        hb["cb"] = time.time()
+        hb["cb_count"] += 1
         need = frames * frame_bytes
         while len(rem) < need:
             try:
@@ -591,10 +630,56 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
     t = threading.Thread(target=producer, daemon=True)
     t.start()
 
+    def watchdog():
+        """每 5 秒体检一次：区分「没数据」和「声卡回调卡死」，卡死时打印线程栈。"""
+        warned_data = warned_cb = False
+        while not stop.is_set() and t.is_alive():
+            time.sleep(5)
+            if stop.is_set():
+                return
+            now = time.time()
+            since_data, since_cb = now - hb["data"], now - hb["cb"]
+            buffered = q.qsize() * 4096 / byte_rate * 1000
+            if not hb["cb_started"]:
+                # 会话启动阶段（发现手机→建流→开 OutputStream 都在首次回调之前），
+                # 此时"尚无回调"属正常，不能误判为停摆；超过 15s 才算真异常
+                waited = now - hb["t_start"]
+                if waited > 15:
+                    debuglog.log("engine",
+                                 f"⚠️ 会话已启动 {waited:.0f}s 但声卡从未回调"
+                                 f"（源={hb['src']} 缓冲{buffered:.0f}ms "
+                                 f"producer存活={t.is_alive()}）")
+                    debuglog.dump_thread("engine", t.ident, "producer")
+                continue
+            if since_data > 5 or since_cb > 2:
+                debuglog.log("engine",
+                             f"⚠️ 异常：无数据 {since_data:.1f}s / 回调停滞 {since_cb:.1f}s "
+                             f"（源={hb['src']} 缓冲{buffered:.0f}ms 峰值{stat.get('peak', 0)}% "
+                             f"欠载{stat['underruns']} 回调数{hb['cb_count']} "
+                             f"producer存活={t.is_alive()}）")
+                if since_data > 8 and not warned_data:
+                    warned_data = True
+                    debuglog.dump_thread("engine", t.ident, "producer")
+                if since_cb > 3 and not warned_cb:
+                    warned_cb = True
+                    debuglog.log("engine",
+                                 "声卡回调停摆：PortAudio 未再调用 callback"
+                                 "（常见原因：系统睡眠唤醒后设备失效 / 设备被切换 / 输出设备被占用）")
+                continue
+            warned_data = warned_cb = False
+            debuglog.log("engine",
+                         f"心跳正常：缓冲{buffered:.0f}ms 峰值{stat.get('peak', 0)}% "
+                         f"欠载{stat['underruns']} 回调{hb['cb_count']}/5s "
+                         f"累计{stat['bytes'] // 1024}KB 源={hb['src']}")
+
+    threading.Thread(target=watchdog, daemon=True).start()
+
     # 预缓冲：让队列先攒一点，抗网络抖动
     time.sleep(PREFILL_SECONDS)
 
     print(f"[音频] {rate} Hz / {ch} ch / {bits}bit，写入 BlackHole…（Ctrl+C 退出）", flush=True)
+    debuglog.log("engine", f"开始推流：{rate}Hz {ch}ch {bits}bit 源={hb['src']} "
+                           f"降噪={denoise} 输出设备={out_idx} url={url}")
     try:
         with sd.OutputStream(device=out_idx, samplerate=rate, channels=ch,
                              dtype=dtype, callback=callback):
@@ -639,10 +724,16 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
             raw_resp.close()   # 主动关流：手机端收 RST 后清掉客户端、恢复 UDP 公告
         except Exception:
             pass
+    reason = "收到停止信号" if stop.is_set() else (
+        "producer 已退出（流中断）" if not t.is_alive() else "主循环未知原因退出")
+    debuglog.log("engine", f"推流结束：{reason}，会话 {time.time() - t0:.0f}s "
+                           f"累计{stat['bytes'] // 1024}KB 欠载{stat['underruns']} "
+                           f"回调{hb['cb_count']}")
     raise ConnectionError("音频流结束（服务器关闭或流中断），准备重连")
 
 
 def main():
+    debuglog.install("engine")
     sys.stdout = _PipeSafeStdout(sys.stdout)
     sys.stderr = _PipeSafeStdout(sys.stderr)
     ap = argparse.ArgumentParser(description="把手机麦克风变成 Mac 输入设备")
@@ -667,7 +758,8 @@ def main():
 
     stop = threading.Event()
     # 菜单栏应用用 SIGTERM 结束引擎：置 stop 让录音收尾/资源释放走正常路径，而不是被硬杀
-    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    signal.signal(signal.SIGTERM, lambda *_: (debuglog.log("engine", "收到 SIGTERM，停止推流"),
+                                              stop.set()))
     fails = 0
 
     def wait_interruptible(seconds: float, reason: str = ""):
@@ -696,19 +788,24 @@ def main():
                 except Exception:
                     pass
             t_stream = time.time()
+            debuglog.log("engine", f"尝试连接 {url}（第 {fails + 1} 次尝试）")
             try:
                 stream_once(url, out_idx, stop)
                 return
             except KeyboardInterrupt:
                 stop.set()
                 print("\n已退出", flush=True)
+                debuglog.log("engine", "用户 Ctrl+C 退出")
                 return
             except Exception as e:
                 # 上次是真会话（连上并正常跑了一阵）则不算连接失败，退避重新计数
-                if time.time() - t_stream > 15:
+                dur = time.time() - t_stream
+                if dur > 15:
                     fails = 0
                 fails += 1
                 backoff = min(fails, 6)   # 1,2,3…6：首次失败 1 秒后就重试（发现本身很快）
+                debuglog.log("engine", f"连接失败（本次会话 {dur:.1f}s，第 {fails} 次）："
+                                       f"{type(e).__name__}: {e}", exc=True)
                 wait_interruptible(backoff, f"[连接] {e}（第 {fails} 次失败），{backoff}s 后重试")
     except KeyboardInterrupt:
         stop.set()

@@ -11,6 +11,8 @@ from pathlib import Path
 import media_ducking
 import rumps
 
+import debuglog
+
 BASE = Path.home() / "LocalStorage" / "GitHub" / "PhoneMic"
 ENGINE = BASE / "phonemic.py"
 PYTHON = sys.executable
@@ -125,6 +127,17 @@ def start_ptt_listener(on_state, on_error, on_mode=None):
 
         def tap_callback(_proxy, _etype, event, _refcon):
             try:
+                etype = Quartz.CGEventGetType(event)
+                # 系统会在回调超时或用户输入打乱顺序时悄悄禁用 tap：
+                # 不处理的话，右⌥ 会毫无征兆地失灵（表现为"按下没反应、录不上音"）
+                if etype in (Quartz.kCGEventTapDisabledByTimeout,
+                             Quartz.kCGEventTapDisabledByUserInput):
+                    debuglog.log("menu", f"⚠️ 事件 tap 被系统禁用（type={etype}），自动重新启用")
+                    try:
+                        Quartz.CGEventTapEnable(tap, True)
+                    except Exception:
+                        debuglog.log("menu", "重新启用 tap 失败", exc=True)
+                    return event
                 keycode = Quartz.CGEventGetIntegerValueField(
                     event, Quartz.kCGKeyboardEventKeycode)
                 # 只认按下沿（Alternate 位被置位 = 按下）；松开事件忽略
@@ -153,13 +166,18 @@ def start_ptt_listener(on_state, on_error, on_mode=None):
                 Quartz.CGEventTapEnable(tap, True)
                 if on_mode:
                     on_mode("tap")
+                debuglog.log("menu", "PTT 监听：事件 tap 模式已启用")
                 Quartz.CFRunLoopRun()
+                debuglog.log("menu", "⚠️ PTT 事件 tap 的 CFRunLoop 意外返回（事件监听中断）")
                 return
             except Exception:
+                debuglog.log("menu", "PTT 事件监听异常", exc=True)
                 on_error("PTT 事件监听异常退出")
                 return
 
         # 降级方案：轮询（20ms）。被输入法拦截的键看不到，但免系统权限
+        debuglog.log("menu", "PTT 监听：未取得输入监控权限，降级为轮询模式"
+                             "（微信输入法等可能拦截按键导致失效）")
         if on_mode:
             on_mode("poll")
         pressed = False
@@ -192,6 +210,7 @@ TEXTS = {
 class PhoneMicMenu(rumps.App):
 
     def __init__(self):
+        debuglog.install("menu")
         super().__init__(name="PhoneMic", quit_button="退出 PhoneMic")
         self.paths = build_icons()
         self.icon = self.paths["stopped"]
@@ -214,6 +233,7 @@ class PhoneMicMenu(rumps.App):
         self.ptt_error = None
         self.ptt_mode = None
         self.ptt_active = _read_ptt()
+        self._last_logged_status = None
         self.item_open_rec = rumps.MenuItem("打开录音文件夹", callback=self.on_open_rec)
         self.item_reconnect = rumps.MenuItem("立即重连手机", callback=self.on_reconnect)
         self.item_sys = rumps.MenuItem("接管系统输入（断线自动还原）", callback=self.on_sysinput)
@@ -238,11 +258,17 @@ class PhoneMicMenu(rumps.App):
         # PTT：单击右 Option 切换录音开关，状态写 .ptt 供引擎读取
         try:
             PTT_FILE.write_text("1" if self.ptt_active else "0")
+            if self.ptt_active:
+                debuglog.log("menu", "⚠️ 启动时发现录音开关处于「开」，已沿用（上次可能未正常结束录音）")
         except Exception:
             pass
+        def _on_ptt_error(msg):
+            self.ptt_error = msg
+            debuglog.log("menu", f"⚠️ PTT 异常：{msg}")
+
         start_ptt_listener(
             on_state=self._on_ptt_state_changed,
-            on_error=lambda msg: setattr(self, "ptt_error", msg),
+            on_error=_on_ptt_error,
             on_mode=lambda m: setattr(self, "ptt_mode", m),
         )
         # 孤儿状态清理：若上次异常退出把系统输入留在 BlackHole 且未开启接管，则还原
@@ -280,6 +306,7 @@ class PhoneMicMenu(rumps.App):
         )
         self.should_run = True
         self.status = "connecting"
+        debuglog.log("menu", f"拉起引擎 pid={self.proc.pid}（{PYTHON} {ENGINE} --auto）")
         threading.Thread(target=self.watch, daemon=True).start()
 
     def _engine_pid(self) -> int:
@@ -294,12 +321,18 @@ class PhoneMicMenu(rumps.App):
         try:
             for line in self.proc.stdout:
                 line = line.strip()
+                if line:
+                    debuglog.log("engine-out", line)   # 引擎打印进日志文件，避免管道丢失
                 if line.startswith("[音频]"):
                     self.status = "streaming"
                 elif line.startswith(("[连接]", "[发现]")):
                     # 断线/重新寻找时必须回落：否则菜单假显"已连通"，
                     # 系统输入也不会在断流期间还原（手机离线 = 全系统哑麦）
                     self.status = "connecting"
+            code = self.proc.poll()
+            debuglog.log("menu", f"引擎已退出 pid={self.proc.pid} 退出码={code} "
+                                 f"should_run={self.should_run}（0=正常退出，"
+                                 f"负数为被信号杀死，如 -15=SIGTERM -9=SIGKILL）")
             while self.should_run:
                 time.sleep(2)
                 if not self.should_run or self.proc.poll() is None:
@@ -309,13 +342,18 @@ class PhoneMicMenu(rumps.App):
                 # 等孤儿退出后再接管（期间 refresh() 依据 .level 仍能正确显示状态）
                 orphan = self._engine_pid()
                 if orphan and orphan != self.proc.pid and _pid_alive(orphan):
+                    debuglog.log("menu", f"检测到孤儿引擎 pid={orphan} 仍在运行，暂不拉起新引擎")
                     continue
+                if not self.should_run:
+                    break
+                debuglog.log("menu", "准备重新拉起引擎")
                 self.spawn()
                 return
         except Exception:
-            pass
+            debuglog.log("menu", "watch 线程异常", exc=True)
         if not self.should_run:
             self.status = "stopped"
+            debuglog.log("menu", "引擎停止（用户点击停止或退出）")
 
     def _stop_engines(self):
         """停掉本实例引擎与可能存在的孤儿引擎（写 BlackHole 的只能有一个）。"""
@@ -344,6 +382,10 @@ class PhoneMicMenu(rumps.App):
         """右 Option 切换：同步更新 PTT 状态，并自动暂停/恢复背景音。"""
         self.ptt_active = active
         _write_ptt(active)
+        debuglog.log("menu", f"右⌥ 切换录音 → {'开始录音' if active else '结束录音'}"
+                             f"（录音存档开关={'开' if self._flag_on(RECORD_FILE) else '关'}"
+                             f"，引擎={'在跑' if self.proc and self.proc.poll() is None else '未运行'}"
+                             f"，状态={self.status}）")
         if active:
             self.ducker.duck()
         else:
@@ -434,7 +476,9 @@ class PhoneMicMenu(rumps.App):
                 PREV_INPUT_FILE.write_text(prev)
             except Exception:
                 pass
-        if self._set_input(BLACKHOLE_NAME):
+        ok = self._set_input(BLACKHOLE_NAME)
+        debuglog.log("menu", f"接管系统输入 → {BLACKHOLE_NAME}（原设备={prev!r}，结果={'成功' if ok else '失败'}）")
+        if ok:
             self._sys_switched = True
 
     def _restore_sys_input(self):
@@ -444,6 +488,7 @@ class PhoneMicMenu(rumps.App):
                 prev = PREV_INPUT_FILE.read_text().strip()
         except Exception:
             pass
+        debuglog.log("menu", f"还原系统输入 → {prev!r}")
         self._set_input(prev)
         self._sys_switched = False
 
@@ -519,6 +564,12 @@ class PhoneMicMenu(rumps.App):
             elif self.status == "streaming":
                 self.status = "connecting"
 
+        # 状态变迁只在翻转时记一行，避免每秒刷屏
+        if self.status != self._last_logged_status:
+            debuglog.log("menu", f"状态变迁：{self._last_logged_status} → {self.status}"
+                                 f"（.level 新鲜={'是' if self.should_run and self.status == 'streaming' else '否'}）")
+            self._last_logged_status = self.status
+
         # 系统输入接管：连通即接管，断线/停止自动还原
         takeover = self._flag_on(SYSINPUT_FILE) == 1
         if takeover and self.status == "streaming" and not self._sys_switched:
@@ -569,9 +620,25 @@ class PhoneMicMenu(rumps.App):
             self.item_status.title = status_text
         self.item_toggle.title = "停止" if self.should_run else "启动"
 
+        # 每分钟一次状态快照：便于把"某时刻的现象"和日志时间线对齐
+        now = time.time()
+        if now - getattr(self, "_last_snapshot", 0) > 60:
+            self._last_snapshot = now
+            try:
+                age = now - LEVEL_FILE.stat().st_mtime
+                lv = LEVEL_FILE.read_text().strip()
+            except Exception:
+                age, lv = -1, "?"
+            engine = "存活" if (self.proc and self.proc.poll() is None) else "已退出"
+            debuglog.log("menu", f"快照：状态={self.status} 引擎={engine} 电平={lv}%"
+                                 f"（{age:.1f}s 前更新）录音存档={'开' if self._flag_on(RECORD_FILE) else '关'}"
+                                 f" 右⌥={'录音中' if self.ptt_active else '待机'}"
+                                 f" 系统输入接管={self._sys_switched}")
+
 
     def quit(self, sender=None):
         """退出前归还原系统输入设备与静音状态并停掉引擎，避免留下哑麦状态和孤儿引擎进程。"""
+        debuglog.log("menu", "菜单栏退出：清理引擎与系统输入")
         try:
             self.ducker.cleanup()
         except Exception:

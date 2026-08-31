@@ -1,7 +1,7 @@
 # 🚀 Project Progress & Agent Handover — PhoneMic
 
-> **Last Updated:** 2026-08-31T11:49:52Z (read-only projection)
-> **Git State:** `clean` | **Branch:** `main` | **Events Count:** 7
+> **Last Updated:** 2026-08-31T14:20:32Z (read-only projection)
+> **Git State:** `dirty` | **Branch:** `main` | **Events Count:** 7
 
 ---
 
@@ -20,7 +20,10 @@ _No active leases._
 
 ## 📝 Working Tree Changes
 
-_Working tree is clean._
+- `.M` `.gitignore`
+- `.M` `PhoneMicMenu.py`
+- `.M` `phonemic.py`
+- `??` `debuglog.py`
 
 ## 💡 Handoff Instructions for Next Agent
 

@@ -22,6 +22,9 @@ record
 icons/
 
 .DS_Store
+# 临时诊断日志（排查完毕后可连同 debuglog.py 一并移除）
+.debug.log
+.debug.log.1
 sysinput
 .prev_input
 .menu_lock
