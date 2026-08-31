@@ -27,3 +27,6 @@ sysinput
 .menu_lock
 .reconnect
 auto_duck
+
+# WorkBuddy 工作区数据
+.workbuddy/
