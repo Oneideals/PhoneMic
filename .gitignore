@@ -33,3 +33,6 @@ auto_duck
 
 # WorkBuddy 工作区数据
 .workbuddy/
+
+# 内部自动生成（baton 进度投影，非源码，随本地仓库重建）
+PROGRESS.md

@@ -13,7 +13,7 @@ import rumps
 
 import debuglog
 
-BASE = Path.home() / "LocalStorage" / "GitHub" / "PhoneMic"
+BASE = Path(__file__).resolve().parent   # 项目根（脚本所在目录），保证 clone 到任意位置都能运行
 ENGINE = BASE / "phonemic.py"
 PYTHON = sys.executable
 AGENT = Path.home() / "Library" / "LaunchAgents" / "com.jerry.phonemic.menu.plist"

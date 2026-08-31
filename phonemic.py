@@ -35,7 +35,7 @@ import sounddevice as sd
 
 import debuglog
 
-BASE = Path.home() / "LocalStorage" / "GitHub" / "PhoneMic"
+BASE = Path(__file__).resolve().parent   # 项目根（脚本所在目录），保证 clone 到任意位置都能运行
 LAST_URL_FILE = BASE / ".phonemic_last_url"
 LOCK_FILE = BASE / ".phonemic_lock"
 GAIN_FILE = BASE / "gain_db"        # 数字增益（dB），菜单栏应用写入，引擎每秒读取
