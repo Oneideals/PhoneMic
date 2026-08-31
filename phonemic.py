@@ -189,7 +189,7 @@ _ANNOUNCE = {"url": None, "at": 0.0}
 
 
 def udp_announce_listener():
-    """常驻后台：监听手机 'PHONEMIC <port>' 公告，更新缓存。"""
+    """常驻后台：监听手机 'PHONEMIC <port>' / 'PHONEMIC <port> UDP <udp_port>' 公告，更新缓存。"""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -200,8 +200,12 @@ def udp_announce_listener():
         try:
             data, addr = s.recvfrom(256)
             msg = data.decode("utf-8", "ignore").strip()
-            if msg.startswith("PHONEMIC ") and msg[8:].strip().isdigit():
-                _ANNOUNCE["url"] = f"http://{addr[0]}:{msg[8:].strip()}"
+            parts = msg.split()
+            if len(parts) >= 2 and parts[0] == "PHONEMIC":
+                tcp_port = parts[1]
+                udp_port = parts[3] if len(parts) >= 4 and parts[2] == "UDP" else "58082"
+                _ANNOUNCE["url"] = f"udp://{addr[0]}:{udp_port}"
+                _ANNOUNCE["http_url"] = f"http://{addr[0]}:{tcp_port}"
                 _ANNOUNCE["at"] = time.time()
         except Exception:
             time.sleep(0.5)
@@ -482,16 +486,98 @@ class StreamTee:
         return chunk
 
 
+class UdpAudioReceiver:
+    """UDP 极速音频接收器：10ms 帧直接接收，带丢包补偿与序列号检查，无阻塞零延迟。"""
+
+    def __init__(self, host: str, port: int, stop: threading.Event):
+        self.host = host
+        self.port = port
+        self.stop = stop
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("", 0))
+        self.sock.settimeout(1.0)
+        self.last_seq = None
+        self.lost_packets = 0
+        self.received_packets = 0
+        self.buf = bytearray()
+        self._send_ping()
+
+        def pinger():
+            while not self.stop.is_set():
+                self._send_ping()
+                for _ in range(20):
+                    if self.stop.is_set():
+                        break
+                    time.sleep(0.1)
+            try:
+                self.sock.sendto(b"PHONEMIC_UDP_STOP", (self.host, self.port))
+            except Exception:
+                pass
+
+        threading.Thread(target=pinger, daemon=True).start()
+
+    def _send_ping(self):
+        try:
+            self.sock.sendto(b"PHONEMIC_UDP_START", (self.host, self.port))
+        except Exception:
+            pass
+
+    def read(self, n: int) -> bytes:
+        while len(self.buf) < n and not self.stop.is_set():
+            try:
+                data, addr = self.sock.recvfrom(2048)
+                if len(data) >= 8 and data[:4] == b"PMIC":
+                    seq = struct.unpack(">I", data[4:8])[0]
+                    pcm = data[8:]
+                    if self.last_seq is not None:
+                        diff = (seq - self.last_seq) & 0xFFFFFFFF
+                        if 1 < diff < 50:
+                            self.lost_packets += (diff - 1)
+                            self.buf.extend(b"\x00" * ((diff - 1) * len(pcm)))
+                    self.last_seq = seq
+                    self.received_packets += 1
+                    self.buf.extend(pcm)
+            except socket.timeout:
+                if self.stop.is_set():
+                    break
+                continue
+            except Exception:
+                break
+        res, self.buf = bytes(self.buf[:n]), self.buf[n:]
+        return res
+
+    def close(self):
+        try:
+            self.sock.sendto(b"PHONEMIC_UDP_STOP", (self.host, self.port))
+            self.sock.close()
+        except Exception:
+            pass
+
+
 def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
-    req = urllib.request.Request(url, headers={"User-Agent": "PhoneMic/1.0"})
-    # timeout 同时约束连接与每次 read：手机离开 WiFi 范围时不会有 TCP RST，
-    # 靠这个读超时把"无限挂起"压到 3 秒内检测（正常流每 ~128ms 就有一块数据）
-    resp = DIRECT_OPENER.open(req, timeout=3)
-    raw_resp = resp
-    payload, (ch, rate, bits) = wav_head_and_payload(resp)
-    dtype = DTYPES.get(bits)
-    if dtype is None:
-        raise ValueError(f"不支持的位深 {bits}bit（请在手机端把音频格式设为 PCM 16bit）")
+    if url.startswith("udp://"):
+        host_port = url[6:].split(":")
+        host = host_port[0]
+        port = int(host_port[1]) if len(host_port) > 1 else 58082
+        udp_rcv = UdpAudioReceiver(host, port, stop)
+        resp = udp_rcv
+        raw_resp = resp
+        payload = b""
+        ch, rate, bits = 1, 48000, 16
+        dtype = "int16"
+        print(f"[传输] 采用 UDP 极速低延迟模式 (目标={host}:{port})", flush=True)
+        debuglog.log("engine", f"启动 UDP 推流会话 (目标={host}:{port})")
+    else:
+        req = urllib.request.Request(url, headers={"User-Agent": "PhoneMic/1.0"})
+        # timeout 同时约束连接与每次 read：手机离开 WiFi 范围时不会有 TCP RST，
+        # 靠这个读超时把"无限挂起"压到 3 秒内检测（正常流每 ~128ms 就有一块数据）
+        resp = DIRECT_OPENER.open(req, timeout=3)
+        raw_resp = resp
+        payload, (ch, rate, bits) = wav_head_and_payload(resp)
+        dtype = DTYPES.get(bits)
+        if dtype is None:
+            raise ValueError(f"不支持的位深 {bits}bit（请在手机端把音频格式设为 PCM 16bit）")
     t0 = time.time()
 
     # 录音存档（可选，PTT 模式）：只有按住右 Option 期间的音频才落盘；

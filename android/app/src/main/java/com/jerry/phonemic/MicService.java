@@ -40,8 +40,13 @@ public class MicService extends Service {
     /** UDP 直连通道：电脑监听 58080 收公告，手机监听 58081 收查询（绕过 mDNS 的兜底） */
     private static final int ANNOUNCE_PORT = 58080;
     private static final int QUERY_PORT = 58081;
+    public static final int UDP_AUDIO_PORT = 58082;
 
     private final CopyOnWriteArrayList<OutputStream> clients = new CopyOnWriteArrayList<>();
+    private final java.util.concurrent.ConcurrentHashMap<java.net.InetSocketAddress, Long> udpClients =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private java.net.DatagramSocket udpAudioSocket;
+    private int udpSeq = 0;
     private AudioRecord record;
     private android.media.audiofx.NoiseSuppressor ns;
     private volatile boolean running;
@@ -69,6 +74,8 @@ public class MicService extends Service {
         try { if (record != null) { record.stop(); record.release(); } } catch (Exception ignored) {}
         try { if (ns != null) ns.release(); } catch (Exception ignored) {}
         try { if (serverSocket != null) serverSocket.close(); } catch (Exception ignored) {}
+        try { if (udpAudioSocket != null) udpAudioSocket.close(); } catch (Exception ignored) {}
+        udpClients.clear();
         for (OutputStream c : clients) { try { c.close(); } catch (Exception ignored) {} }
         clients.clear();
         super.onDestroy();
@@ -121,6 +128,14 @@ public class MicService extends Service {
             return;
         }
 
+        try {
+            udpAudioSocket = new java.net.DatagramSocket(UDP_AUDIO_PORT);
+        } catch (Exception e) {
+            try {
+                udpAudioSocket = new java.net.DatagramSocket();
+            } catch (Exception ignored) {}
+        }
+
         int minBuf = AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT);
         record = new AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION, RATE,
@@ -136,7 +151,9 @@ public class MicService extends Service {
         } catch (Exception ignored) {}
 
         Thread micThread = new Thread(() -> {
-            byte[] pcm = new byte[4096];
+            byte[] pcm = new byte[960]; // 480 采样 = 10.0 ms 极速帧
+            byte[] udpPacket = new byte[8 + 960];
+            udpPacket[0] = 'P'; udpPacket[1] = 'M'; udpPacket[2] = 'I'; udpPacket[3] = 'C';
             while (running) {
                 int n = record.read(pcm, 0, pcm.length);
                 if (n < 0) {
@@ -167,6 +184,7 @@ public class MicService extends Service {
                     PEAK_HOLD = pct;
                     PEAK_HOLD_AT = nowMs;
                 }
+                // 1. 发送 HTTP TCP 客户端
                 for (OutputStream c : clients) {
                     try {
                         c.write(pcm, 0, n);
@@ -174,6 +192,27 @@ public class MicService extends Service {
                     } catch (Exception e) {
                         clients.remove(c);
                         try { c.close(); } catch (Exception ignored) {}
+                    }
+                }
+                // 2. 发送 UDP 实时推流客户端（10ms 帧，带 PMIC 头与序列号）
+                if (udpAudioSocket != null && !udpClients.isEmpty() && n == 960) {
+                    udpPacket[4] = (byte)(udpSeq >> 24);
+                    udpPacket[5] = (byte)(udpSeq >> 16);
+                    udpPacket[6] = (byte)(udpSeq >> 8);
+                    udpPacket[7] = (byte)(udpSeq);
+                    udpSeq++;
+                    System.arraycopy(pcm, 0, udpPacket, 8, 960);
+                    long nowWall = System.currentTimeMillis();
+                    for (java.util.Map.Entry<java.net.InetSocketAddress, Long> entry : udpClients.entrySet()) {
+                        if (nowWall - entry.getValue() > 8000) {
+                            udpClients.remove(entry.getKey());
+                            continue;
+                        }
+                        try {
+                            java.net.DatagramPacket dp = new java.net.DatagramPacket(
+                                    udpPacket, udpPacket.length, entry.getKey());
+                            udpAudioSocket.send(dp);
+                        } catch (Exception ignored) {}
                     }
                 }
             }
@@ -212,10 +251,10 @@ public class MicService extends Service {
     }
 
     /**
-     * UDP 直连通道（mDNS 失效时的兜底发现）：
-     * 1) 无客户端连接时每秒广播公告 → 电脑回网后秒级自动重连；
-     * 2) 收到电脑 "PHONEMIC_QUERY" 查询立即回公告 → 菜单「立即重连」秒连。
-     * （实测：亮屏/息屏均持续广播，前台服务保活了网络栈）
+     * UDP 直连通道（mDNS 失效时的兜底发现与 UDP 推流注册）：
+     * 1) 周期广播公告（含 TCP 端口与 UDP 音频端口）；
+     * 2) 接收 "PHONEMIC_UDP_START" / "PHONEMIC_UDP_PING" 注册客户端；
+     * 3) 收到 "PHONEMIC_QUERY" 查询立即回公告。
      */
     private void startUdpChannel() {
         new Thread(() -> {
@@ -226,8 +265,8 @@ public class MicService extends Service {
                 byte[] buf = new byte[64];
                 while (running) {
                     try {
-                        if (clients.isEmpty() && PORT_BOUND > 0) {
-                            byte[] ann = ("PHONEMIC " + PORT_BOUND).getBytes("US-ASCII");
+                        if (clients.isEmpty() && udpClients.isEmpty() && PORT_BOUND > 0) {
+                            byte[] ann = ("PHONEMIC " + PORT_BOUND + " UDP " + UDP_AUDIO_PORT).getBytes("US-ASCII");
                             ds.send(new java.net.DatagramPacket(ann, ann.length,
                                     java.net.InetAddress.getByName("255.255.255.255"),
                                     ANNOUNCE_PORT));
@@ -238,9 +277,13 @@ public class MicService extends Service {
                         ds.receive(p);
                         String msg = new String(p.getData(), 0, p.getLength()).trim();
                         if ("PHONEMIC_QUERY".equals(msg) && PORT_BOUND > 0) {
-                            byte[] ann = ("PHONEMIC " + PORT_BOUND).getBytes("US-ASCII");
+                            byte[] ann = ("PHONEMIC " + PORT_BOUND + " UDP " + UDP_AUDIO_PORT).getBytes("US-ASCII");
                             ds.send(new java.net.DatagramPacket(ann, ann.length,
                                     p.getAddress(), ANNOUNCE_PORT));
+                        } else if (msg.startsWith("PHONEMIC_UDP_START") || msg.startsWith("PHONEMIC_UDP_PING")) {
+                            udpClients.put((java.net.InetSocketAddress) p.getSocketAddress(), System.currentTimeMillis());
+                        } else if (msg.startsWith("PHONEMIC_UDP_STOP")) {
+                            udpClients.remove((java.net.InetSocketAddress) p.getSocketAddress());
                         }
                     } catch (java.net.SocketTimeoutException ignored) {
                     } catch (Exception ignored) {}
@@ -259,7 +302,7 @@ public class MicService extends Service {
             try {
                 java.net.DatagramSocket ds = new java.net.DatagramSocket();
                 ds.setBroadcast(true);
-                byte[] ann = ("PHONEMIC " + PORT_BOUND).getBytes("US-ASCII");
+                byte[] ann = ("PHONEMIC " + PORT_BOUND + " UDP " + UDP_AUDIO_PORT).getBytes("US-ASCII");
                 for (int i = 0; i < 3; i++) {
                     ds.send(new java.net.DatagramPacket(ann, ann.length,
                             java.net.InetAddress.getByName("255.255.255.255"), ANNOUNCE_PORT));
