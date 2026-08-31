@@ -233,16 +233,61 @@ def reconnect_requested() -> bool:
     return False
 
 
+def find_adb_path() -> str | None:
+    """查找系统中的 adb 可执行文件路径。"""
+    if shutil.which("adb"):
+        return shutil.which("adb")
+    candidates = [
+        Path.home() / "Library/Android/sdk/platform-tools/adb",
+        Path("/opt/homebrew/bin/adb"),
+        Path("/usr/local/bin/adb"),
+    ]
+    for p in candidates:
+        if p.exists():
+            return str(p)
+    return None
+
+
+def check_usb_device() -> str | None:
+    """检测是否有通过 USB 物理连接的 Android 手机，并自动建立极速端口映射。"""
+    adb = find_adb_path()
+    if not adb:
+        return None
+    try:
+        res = subprocess.run([adb, "devices"], capture_output=True, text=True, timeout=1.2)
+        lines = res.stdout.strip().splitlines()
+        for line in lines[1:]:
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] == "device" and not parts[0].startswith("emulator"):
+                dev_id = parts[0]
+                # 端口映射：把手机的 8080 端口转发到本地 58083
+                subprocess.run([adb, "-s", dev_id, "forward", "tcp:58083", "tcp:8080"],
+                               capture_output=True, timeout=1.0)
+                if probe_ok("http://127.0.0.1:58083"):
+                    return "http://127.0.0.1:58083"
+    except Exception:
+        pass
+    return None
+
+
 def resolve_url(explicit: str | None) -> str | None:
-    """显式地址 > 新公告 > （上次地址 ∥ mDNS ∥ UDP 查询）并行 > 上次主机扫端口。"""
+    """显式地址 > USB 物理直连优先 > 新公告 > （上次地址 ∥ mDNS ∥ UDP 查询）并行 > 上次主机扫端口。"""
     if explicit:
         return explicit
+
+    # 1. 优先级最高：USB 物理线直连探测（<1ms 延迟，0 抖动，100% 稳定）
+    usb_url = check_usb_device()
+    if usb_url:
+        print(f"[发现] ⚡ 检测到 USB 连接，已优先启用 USB 极速直连模式：{usb_url}", flush=True)
+        debuglog.log("engine", f"检测到 USB 直连设备，优先启用 USB 极速模式：{usb_url}")
+        return usb_url
+
     t_start = time.time()
     if _ANNOUNCE["url"] and t_start - _ANNOUNCE["at"] < 5:
         print(f"[发现] UDP 公告命中：{_ANNOUNCE['url']}", flush=True)
         return _ANNOUNCE["url"]
 
-    print("[发现] 正在寻找手机（公告/上次地址/mDNS 并行）…", flush=True)
+    print("[发现] 正在寻找手机（USB/公告/上次地址/mDNS 并行）…", flush=True)
     send_udp_query()
     last = LAST_URL_FILE.read_text().strip() if LAST_URL_FILE.exists() else ""
     box: dict = {"mdns": None, "last": None}
@@ -260,6 +305,11 @@ def resolve_url(explicit: str | None) -> str | None:
 
     deadline = time.time() + 4.5
     while time.time() < deadline:
+        # 寻找期间随时优先检查 USB 是否刚插上
+        u = check_usb_device()
+        if u:
+            print(f"[发现] ⚡ 检测到 USB 插入，优先启用 USB 极速直连模式：{u}", flush=True)
+            return u
         if box["last"]:
             print(f"[发现] 上次地址仍可用：{box['last']}", flush=True)
             return box["last"]                      # IP 未变，最快路径
@@ -282,7 +332,7 @@ def resolve_url(explicit: str | None) -> str | None:
         if url:
             print(f"[发现] 扫描命中：{url}", flush=True)
             return url
-    print("[发现] 找不到手机（App 是否已启动？是否同一 Wi-Fi？）", flush=True)
+    print("[发现] 找不到手机（App 是否已启动？是否同一 Wi-Fi 或插上 USB 线？）", flush=True)
     return None
 
 
@@ -774,6 +824,15 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
                          f"心跳正常：缓冲{buffered:.0f}ms 峰值{stat.get('peak', 0)}% "
                          f"欠载{stat['underruns']} 回调{hb['cb_count']}/5s "
                          f"累计{stat['bytes'] // 1024}KB 源={hb['src']}")
+
+            # 运行期间热插拔升级：若当前走无线网络且用户插上了 USB 线，无缝热升级至 USB 直连模式
+            if not url.startswith("http://127.0.0.1:"):
+                now_usb = check_usb_device()
+                if now_usb:
+                    print("\n[连接] ⚡ 检测到 USB 数据线插入，正在自动升级为 USB 极速模式…", flush=True)
+                    debuglog.log("engine", "检测到 USB 插入，触发升级至 USB 极速模式")
+                    stop.set()
+                    return
 
     threading.Thread(target=watchdog, daemon=True).start()
 

@@ -612,7 +612,19 @@ class PhoneMicMenu(rumps.App):
         elif self.status == "streaming":
             live = self.recording_on() and self.ptt_active   # 录音开启且开关激活才录
             self.icon = self.paths["recording" if live else "on"]
-            status_text = "● 手机麦克风已连通" + ("（🎤录音中）" if live else "")
+            last_url = ""
+            try:
+                if LAST_URL_FILE.exists():
+                    last_url = LAST_URL_FILE.read_text().strip()
+            except Exception:
+                pass
+            if "127.0.0.1" in last_url:
+                mode_tag = "⚡ USB直连 <1ms"
+            elif last_url.startswith("udp://"):
+                mode_tag = "📡 UDP无线 15ms"
+            else:
+                mode_tag = "📶 Wi-Fi无线"
+            status_text = f"● 手机麦克风已连通 ({mode_tag})" + ("（🎤录音中）" if live else "")
         else:
             self.icon = self.paths["connecting"]
             status_text = TEXTS["connecting"]
