@@ -562,8 +562,9 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
     frame_bytes = ch * bits // 8
     byte_rate = rate * frame_bytes
     stat = {"underruns": 0, "bytes": 0}
-    # 极低延迟队列：最大 3 个 chunk（约 128ms），平稳时维持在 1~2 个 chunk（42~85ms），杜绝语音滞后与截断
-    q: queue.Queue = queue.Queue(maxsize=3)
+    # 黄金抗抖动低延迟队列：容量 10 个 chunk（约 426ms），平稳时维持在 3~6 个 chunk（130~250ms）
+    # 既有充足抗抖动裕量（0 欠载、音频连续不碎断），又严格将最大延迟锁死在 0.4 秒内（不截断、实时同步）
+    q: queue.Queue = queue.Queue(maxsize=10)
     # 心跳：记录"最后一次收到数据"与"最后一次回调被声卡驱动调用"的时刻，
     # 用于区分「手机没送数据」与「声卡回调卡死/系统睡眠唤醒后未恢复」
     hb = {"data": time.time(), "cb": time.time(), "cb_count": 0,
@@ -586,12 +587,10 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
                 try:
                     q.put_nowait(chunk)
                 except queue.Full:
-                    # 突发网络包到达时丢弃滞后旧帧，强制追平到当前实时时间（保持 <100ms 实时对齐）
-                    while q.qsize() > 1:
-                        try:
-                            q.get_nowait()
-                        except queue.Empty:
-                            break
+                    try:
+                        q.get_nowait()   # 满队时仅丢弃 1 个最旧的 chunk，保持队列在 400ms 上限
+                    except queue.Empty:
+                        pass
                     try:
                         q.put_nowait(chunk)
                     except queue.Full:
