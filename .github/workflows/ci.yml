@@ -24,12 +24,16 @@ jobs:
 
       - name: Install dependencies
         run: |
+          sudo apt-get update && sudo apt-get install -y libportaudio2
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Compile python files
         run: |
           python -m py_compile phonemic.py PhoneMicMenu.py media_ducking.py debuglog.py
+
+      - name: Run logic tests (no audio hardware required)
+        run: python tests/test_logic.py
 
   android-build:
     name: Android Build

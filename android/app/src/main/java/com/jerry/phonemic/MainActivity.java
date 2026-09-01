@@ -29,7 +29,8 @@ public class MainActivity extends Activity {
     private static final String KEY_GAIN = "gain_db";
 
     private MaterialButton btnToggle, gainDown, gainUp, btnNotify;
-    private TextView statusText, modeStatusText, modeDetailText, levelText, peakText, gainLabel, addrText;
+    private TextView statusText, modeStatusText, modeDetailText, levelText, peakText, gainLabel,
+            addrText, tokenText;
     private LinearProgressIndicator levelBar;
     private final Handler ticker = new Handler();
     private final Runnable tick = new Runnable() {
@@ -172,6 +173,34 @@ public class MainActivity extends Activity {
         addrText.setTextColor(onSurface);
         addrText.setTextIsSelectable(true);
         ad.addView(addrText);
+        ad.addView(label("配对码（点击或按按钮一键复制；插 USB 线自动配对）",
+                12, onSurfVar, 4));
+
+        LinearLayout tokenRow = new LinearLayout(this);
+        tokenRow.setOrientation(LinearLayout.HORIZONTAL);
+        tokenRow.setGravity(Gravity.CENTER_VERTICAL);
+
+        tokenText = new TextView(this);
+        tokenText.setTextSize(18);
+        tokenText.setTextColor(onSurface);
+        tokenText.setTypeface(android.graphics.Typeface.MONOSPACE,
+                android.graphics.Typeface.BOLD);
+        tokenText.setOnClickListener(v -> copyToken());
+
+        MaterialButton btnCopy = new MaterialButton(this, null,
+                com.google.android.material.R.attr.materialButtonOutlinedStyle);
+        btnCopy.setText("复制");
+        btnCopy.setTextSize(13);
+        btnCopy.setInsetTop(0);
+        btnCopy.setInsetBottom(0);
+        btnCopy.setOnClickListener(v -> copyToken());
+
+        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.WRAP_CONTENT, 1);
+        tokenRow.addView(tokenText, tlp);
+        tokenRow.addView(btnCopy, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, dp(38)));
+        ad.addView(tokenRow);
         root.addView(addrCard);
 
         // ── 启停大按钮 ──
@@ -277,7 +306,10 @@ public class MainActivity extends Activity {
         int onPrimary = MaterialColors.getColor(statusText,
                 com.google.android.material.R.attr.colorOnPrimary);
 
-        if (running) {
+        if (MicService.MIC_ERROR != null) {
+            statusText.setText("⚠ " + MicService.MIC_ERROR);
+            statusText.setTextColor(error);
+        } else if (running) {
             statusText.setText("● 麦克风服务运行中");
             statusText.setTextColor(primary);
         } else {
@@ -308,6 +340,7 @@ public class MainActivity extends Activity {
 
         gainLabel.setText(String.format("%+ddB", (int) MicService.GAIN_DB));
         addrText.setText(localAddresses(running));
+        tokenText.setText(MicService.ensureToken(this));
 
         btnToggle.setText(running ? "停止服务" : "启动麦克风服务");
         btnToggle.setBackgroundTintList(ColorStateList.valueOf(
@@ -333,5 +366,18 @@ public class MainActivity extends Activity {
         } catch (Exception ignored) {}
         if (sb.length() == 0) sb.append(running ? "（绑定中…）" : "（启动后自动发现）");
         return sb.toString();
+    }
+
+    private void copyToken() {
+        String tok = MicService.ensureToken(this);
+        if (tok != null && !tok.isEmpty()) {
+            android.content.ClipboardManager cm = (android.content.ClipboardManager)
+                    getSystemService(CLIPBOARD_SERVICE);
+            if (cm != null) {
+                cm.setPrimaryClip(android.content.ClipData.newPlainText("PhoneMic Token", tok));
+                android.widget.Toast.makeText(this,
+                        "已复制配对码: " + tok, android.widget.Toast.LENGTH_SHORT).show();
+            }
+        }
     }
 }

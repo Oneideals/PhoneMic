@@ -15,6 +15,7 @@ recordings/
 .level
 .phonemic_last_url
 .phonemic_lock
+.phonemic_token
 gain_db
 denoise
 record

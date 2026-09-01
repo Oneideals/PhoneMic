@@ -18,7 +18,9 @@
 import argparse
 import fcntl
 import ipaddress
+import os
 import queue
+import re
 import shutil
 import signal
 import socket
@@ -45,13 +47,179 @@ PTT_FILE = BASE / ".ptt"            # 录音开关状态（"1"=录音中，单�
 REC_DIR = BASE / "recordings"       # 录音与指标文件目录
 PTT_MIN_SEGMENT = 0.3               # 短于此秒数的录音段视为误触，丢弃
 RECONNECT_FILE = BASE / ".reconnect"   # 菜单栏「立即重连」信号（存在即触发）
-UDP_ANNOUNCE_PORT = 58080           # 电脑监听：手机 UDP 公告（mDNS 失效时的兜底通道）
-UDP_QUERY_PORT = 58081              # 手机监听：电脑 UDP 查询（手动重连快车道）
+TOKEN_FILE = BASE / ".phonemic_token"  # 配对 token（USB 首次连接自动取回，无线连接凭它鉴权）
+# 发现通道端口。做成可覆盖是为了测试自洽：这两个是**系统级**资源，
+# 同机另一个 PhoneMic 实例绑着 58080 时，SO_REUSEADDR 只保证 bind 不报错，
+# 并不保证收得到包 —— 公告会被另一个实例整个吃掉，症状是"死活发现不了手机"。
+UDP_ANNOUNCE_PORT = int(os.environ.get("PHONEMIC_ANNOUNCE_PORT") or 58080)  # 电脑监听：手机公告
+UDP_QUERY_PORT = int(os.environ.get("PHONEMIC_QUERY_PORT") or 58081)        # 手机监听：电脑查询
 OUTPUT_HINT = "BlackHole"
 PREFILL_SECONDS = 0.30      # 预缓冲：300ms 常数延迟换零欠载（欠载丢音节=识别错误）
 CANDIDATE_PORTS = [8081, 18080, 28080, 8080]
 DTYPES = {8: "uint8", 16: "int16", 32: "int32"}
 GAIN_DB = {"v": 0.0}
+MAX_GAIN_DB = 18.0          # 与手机端 MainActivity.adjustGain 的上限保持一致
+LIMIT_THRESHOLD = 26000.0   # 软限幅起压点（约 -2dBFS）
+LIMIT_CEILING = 32000.0     # 软限幅输出天花板
+AUTO_WAKE_COOLDOWN = 30.0   # ADB 自动唤醒手机 App 的最小间隔（秒）
+USB_PROBE_INTERVAL = 1.0    # 发现循环里 USB 探测的最小间隔（秒），避免每 100ms 打一次 adb
+USB_PROBE_TIMEOUT = 0.3     # 回环探测超时：本机端口转发不需要 2 秒
+_LAST_WAKE = {"at": 0.0}
+_LAST_USB_PROBE = {"at": 0.0, "url": None}
+TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")   # 手机端 Base64-URL(9 字节) = 12 字符
+
+
+# ---------- 配对 token：USB(回环) 自动取回，无线凭它鉴权 ----------
+
+def load_token() -> str:
+    """读取已配对的 token（空串=尚未配对或内容损坏）。"""
+    try:
+        tok = TOKEN_FILE.read_text(errors="replace").strip()
+    except Exception:
+        return ""
+    # 损坏的 token 当作未配对：否则一旦存进非法字符，
+    # 后续每个 HTTP 请求都会死在 "Invalid header value" 上且永远无法自愈
+    return tok if is_valid_token(tok) else ""
+
+
+def is_valid_token(tok: str) -> bool:
+    """配对码必须是 Base64-URL 短串（手机端用 SecureRandom 生成 9 字节编码而来）。"""
+    return bool(tok) and bool(TOKEN_RE.match(tok))
+
+
+def save_token(tok: str) -> None:
+    try:
+        TOKEN_FILE.write_text((tok or "").strip())
+        TOKEN_FILE.chmod(0o600)
+    except Exception:
+        pass
+
+
+def auth_headers() -> dict:
+    """HTTP 拉流的鉴权头；未配对时为空（手机端会拒绝非回环请求）。"""
+    tok = load_token()
+    return {"X-PhoneMic-Token": tok} if tok else {}
+
+
+def udp_start_payload() -> bytes:
+    """UDP 推流注册包；带 token 才会被手机端接受。"""
+    tok = load_token()
+    return f"PHONEMIC_UDP_START {tok}".encode() if tok else b"PHONEMIC_UDP_START"
+
+
+def fetch_token_over_usb(base_url: str) -> bool:
+    """USB(回环) 通道免鉴权，首次连上时把 token 取回本地存档。"""
+    if load_token():
+        return True
+    try:
+        req = urllib.request.Request(base_url.rstrip("/") + "/token",
+                                     headers={"User-Agent": "PhoneMic/1.0"})
+        resp = DIRECT_OPENER.open(req, timeout=2)
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        body = resp.read(128)
+        resp.close()
+    except Exception as e:
+        debuglog.log("engine", f"USB 配对：取 token 失败（手机端可能是旧版本）：{e}")
+        return False
+    tok = body.decode("ascii", "ignore").strip()
+    # 旧版 APK 对任何路径都回 WAV 流。不校验就会把音频数据存成 token，
+    # 于是之后每个 HTTP 请求都带着非法头挂掉 —— 必须内容类型 + 字符集双重校验。
+    if not ctype.startswith("text/plain") or not is_valid_token(tok):
+        debuglog.log("engine", "USB 配对：/token 响应不是合法配对码"
+                               f"（Content-Type={ctype!r} 长度={len(body)}），"
+                               "手机端需升级到带配对功能的版本")
+        return False
+    save_token(tok)
+    print("[配对] ⚡ 已通过 USB 自动完成配对，之后无线连接免手动输入", flush=True)
+    debuglog.log("engine", "USB 配对成功，token 已存档")
+    return True
+
+
+# ---------- 纯函数：增益 / 限幅 / 公告解析 / 链路标签 ----------
+
+def clamp_gain(v) -> float:
+    return max(0.0, min(MAX_GAIN_DB, float(v)))
+
+
+def process_pcm16(data: bytes, gain_db: float):
+    """int16 PCM 加增益 + tanh 软限幅。
+
+    返回 (int16 数组, 触发限幅的采样数, 峰值百分比 0~100)。
+
+    「触发限幅数」统计的是**限幅之前**超过阈值的采样。软限幅把输出压在
+    LIMIT_CEILING(32000) 以下，若像早期版本那样在限幅之后按 >=32600 统计，
+    该指标数学上恒为 0，等于没有这个诊断。
+    """
+    arr = np.frombuffer(data, dtype="int16").astype(np.float32)
+    if gain_db:
+        arr *= 10 ** (gain_db / 20.0)
+    mask = np.abs(arr) > LIMIT_THRESHOLD
+    limited = int(np.count_nonzero(mask))
+    if limited:
+        excess = np.abs(arr[mask]) - LIMIT_THRESHOLD
+        headroom = (32767.0 - LIMIT_THRESHOLD) * 0.8
+        compressed = (LIMIT_THRESHOLD
+                      + (LIMIT_CEILING - LIMIT_THRESHOLD) * np.tanh(excess / headroom))
+        arr[mask] = np.sign(arr[mask]) * compressed
+    np.clip(arr, -32768, 32767, out=arr)
+    peak = int(np.abs(arr).max()) * 100 // 32768 if arr.size else 0
+    return arr.astype("int16"), limited, peak
+
+
+def parse_announce(msg: str) -> dict | None:
+    """解析手机公告 'PHONEMIC <tcp> [UDP <udp>] [RATE <hz>]'。
+
+    旧版手机只发 'PHONEMIC <tcp>'，缺省字段按老默认值补齐（向后兼容）。
+    """
+    parts = msg.split()
+    if len(parts) < 2 or parts[0] != "PHONEMIC":
+        return None
+    try:
+        tcp_port = int(parts[1])
+    except ValueError:
+        return None
+    out = {"tcp_port": tcp_port, "udp_port": 58082, "rate": 48000}
+    for i in range(2, len(parts) - 1, 2):
+        key, val = parts[i].upper(), parts[i + 1]
+        try:
+            if key == "UDP":
+                out["udp_port"] = int(val)
+            elif key == "RATE":
+                out["rate"] = int(val)
+        except ValueError:
+            pass
+    return out
+
+
+def link_mode_label(url: str) -> str:
+    """把连接地址翻译成菜单栏显示的链路名（空地址返回空串，不谎报链路）。"""
+    if not url:
+        return ""
+    if url.startswith("udp://"):
+        return "📡 UDP 极速无线流 (15ms 低延迟)"
+    if "127.0.0.1" in url or "localhost" in url:
+        return "⚡ USB 物理直连 (<1ms 极速)"
+    return "📶 Wi-Fi 局域网流 (40ms)"
+
+
+def parse_udp_url(url: str) -> tuple[str, int]:
+    body = url[6:] if url.startswith("udp://") else url
+    host, _, port = body.partition(":")
+    return host, (int(port) if port.isdigit() else 58082)
+
+
+def auto_wake_allowed() -> bool:
+    """ADB 自动唤醒的冷却闸。
+
+    发现循环与 watchdog 都会调 check_usb_device，无冷却时实测约 1 次/秒
+    执行 `am start`，把手机主界面反复拉到前台。
+    """
+    now = time.time()
+    if now - _LAST_WAKE["at"] < AUTO_WAKE_COOLDOWN:
+        return False
+    _LAST_WAKE["at"] = now
+    return True
+
 
 # 绕过系统代理/环境变量，局域网直连（代理会对局域网流间歇性返回 404）
 DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -92,17 +260,26 @@ class _PipeSafeStdout:
 
 
 def acquire_lock() -> bool:
-    """保证全机只有一个 PhoneMic 实例在写 BlackHole。"""
+    """保证全机只有一个 PhoneMic 实例在写 BlackHole。
+
+    必须用 "a+" 而不是 "w" 打开："w" 会在 flock 之前就截断文件，让每个抢锁
+    失败的实例都把持锁者的 PID 擦成空文件。菜单栏靠读这个 PID 识别孤儿引擎，
+    PID 一丢，孤儿守卫就永久失效 —— 表现为每 2 秒空转拉起一个新引擎，且
+    「停止 / 退出」杀不掉真正在写 BlackHole 的那个进程。
+    """
     global _LOCK_FH
     LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
-    fh = open(LOCK_FILE, "w")
+    fh = open(LOCK_FILE, "a+")
     try:
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        fh.write(str(__import__("os").getpid()))
-        fh.flush()
     except OSError:
+        fh.close()   # 没拿到锁就别占着 fd，更别碰文件内容
         debuglog.log("engine", "单实例锁已被占用，本次退出")
         return False
+    fh.seek(0)
+    fh.truncate()    # 拿到锁之后才允许改内容
+    fh.write(str(__import__("os").getpid()))
+    fh.flush()
     _LOCK_FH = fh
     debuglog.log("engine", f"拿到单实例锁 pid={__import__('os').getpid()}")
     return True
@@ -165,7 +342,8 @@ def scan_host_for_riff(host: str, timeout: float = 0.6) -> str | None:
     def probe(port):
         url = f"http://{host}:{port}/audio.wav"
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "PhoneMic/1.0"})
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "PhoneMic/1.0", **auth_headers()})
             resp = DIRECT_OPENER.open(req, timeout=timeout)
             head = resp.read(4)
             resp.close()
@@ -185,11 +363,11 @@ def scan_host_for_riff(host: str, timeout: float = 0.6) -> str | None:
 
 # 最新手机 UDP 公告缓存：手机无客户端时每秒广播一次，
 # 是 mDNS 失效（Android 回网后 NsdManager 重注册不可靠）时的兜底发现通道
-_ANNOUNCE = {"url": None, "at": 0.0}
+_ANNOUNCE = {"url": None, "http_url": None, "rate": 48000, "at": 0.0}
 
 
 def udp_announce_listener():
-    """常驻后台：监听手机 'PHONEMIC <port>' / 'PHONEMIC <port> UDP <udp_port>' 公告，更新缓存。"""
+    """常驻后台：监听手机 'PHONEMIC <port> [UDP <p>] [RATE <hz>]' 公告，更新缓存。"""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -199,13 +377,11 @@ def udp_announce_listener():
     while True:
         try:
             data, addr = s.recvfrom(256)
-            msg = data.decode("utf-8", "ignore").strip()
-            parts = msg.split()
-            if len(parts) >= 2 and parts[0] == "PHONEMIC":
-                tcp_port = parts[1]
-                udp_port = parts[3] if len(parts) >= 4 and parts[2] == "UDP" else "58082"
-                _ANNOUNCE["url"] = f"udp://{addr[0]}:{udp_port}"
-                _ANNOUNCE["http_url"] = f"http://{addr[0]}:{tcp_port}"
+            info = parse_announce(data.decode("utf-8", "ignore").strip())
+            if info:
+                _ANNOUNCE["url"] = f"udp://{addr[0]}:{info['udp_port']}"
+                _ANNOUNCE["http_url"] = f"http://{addr[0]}:{info['tcp_port']}"
+                _ANNOUNCE["rate"] = info["rate"]
                 _ANNOUNCE["at"] = time.time()
         except Exception:
             time.sleep(0.5)
@@ -248,40 +424,75 @@ def find_adb_path() -> str | None:
     return None
 
 
-def check_usb_device(auto_wake: bool = True) -> str | None:
-    """检测是否有通过 USB 物理连接的 Android 手机，并自动建立极速端口映射与自启动。"""
-    adb = find_adb_path()
-    if not adb:
-        return None
-    try:
-        res = subprocess.run([adb, "devices"], capture_output=True, text=True, timeout=1.2)
-        lines = res.stdout.strip().splitlines()
-        for line in lines[1:]:
-            parts = line.split()
-            if len(parts) >= 2 and parts[1] == "device" and not parts[0].startswith("emulator"):
-                dev_id = parts[0]
-                # 遍历手机可能的候选监听端口
-                for port in [8080, 8081, 18080, 28080]:
-                    subprocess.run([adb, "-s", dev_id, "forward", "tcp:58083", f"tcp:{port}"],
-                                   capture_output=True, timeout=0.5)
-                    if probe_ok("http://127.0.0.1:58083"):
-                        return "http://127.0.0.1:58083"
+USB_URL = "http://127.0.0.1:58083"
 
-                # 手机在线但服务未启动时，尝试通过 ADB 自动唤醒 PhoneMic 服务
-                if auto_wake:
-                    debuglog.log("engine", "检测到 USB 设备在线但服务未响应，尝试通过 ADB 自动拉起 PhoneMic")
-                    subprocess.run([adb, "-s", dev_id, "shell", "am", "start", "-n",
-                                    "com.jerry.phonemic/.MainActivity"],
-                                   capture_output=True, timeout=1.0)
-                    time.sleep(0.4)
-                    for port in [8080, 8081, 18080, 28080]:
-                        subprocess.run([adb, "-s", dev_id, "forward", "tcp:58083", f"tcp:{port}"],
-                                       capture_output=True, timeout=0.5)
-                        if probe_ok("http://127.0.0.1:58083"):
-                            return "http://127.0.0.1:58083"
-    except Exception:
-        pass
+
+def _forward_and_probe(adb: str, dev_id: str) -> str | None:
+    """逐个候选端口建端口转发并探活；命中即顺便完成 USB 免密配对。"""
+    for port in CANDIDATE_PORTS:
+        subprocess.run([adb, "-s", dev_id, "forward", "tcp:58083", f"tcp:{port}"],
+                       capture_output=True, timeout=0.5)
+        # 回环转发不需要 2 秒超时：端口没服务时立刻 RST，有服务时立刻回 RIFF
+        if probe_ok(USB_URL, timeout=USB_PROBE_TIMEOUT):
+            fetch_token_over_usb(USB_URL)
+            return USB_URL
     return None
+
+
+def check_usb_device(auto_wake: bool = True) -> str | None:
+    """检测 USB 物理连接的 Android 手机，建立极速端口映射。
+
+    带 1 秒结果缓存：发现循环每 100ms 调一次、watchdog 每 2 秒调一次，
+    没有缓存的话光 `adb devices` 就能把 4.5 秒的发现窗口拖到 20 秒以上。
+    """
+    now = time.time()
+    if os.environ.get("PHONEMIC_NO_USB") == "1":
+        return None   # 集成测试用：别让插着的真手机劫持测试里的假手机
+    if now - _LAST_USB_PROBE["at"] < USB_PROBE_INTERVAL:
+        return _LAST_USB_PROBE["url"]
+    _LAST_USB_PROBE["at"] = now
+
+    url = None
+    adb = find_adb_path()
+    if adb:
+        try:
+            res = subprocess.run([adb, "devices"], capture_output=True, text=True, timeout=1.2)
+            for line in res.stdout.strip().splitlines()[1:]:
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] == "device" and not parts[0].startswith("emulator"):
+                    dev_id = parts[0]
+                    url = _forward_and_probe(adb, dev_id)
+                    # 手机在线但服务没起：拉起主界面补启动。必须走冷却闸，
+                    # 否则发现循环与 watchdog 会以约 1 次/秒的频率反复把 App 弹到前台
+                    if not url and auto_wake and auto_wake_allowed():
+                        debuglog.log("engine", "USB 设备在线但服务未响应，通过 ADB 拉起 PhoneMic"
+                                               f"（{AUTO_WAKE_COOLDOWN:.0f}s 内不再重试）")
+                        subprocess.run([adb, "-s", dev_id, "shell", "am", "start", "-n",
+                                        "com.jerry.phonemic/.MainActivity"],
+                                       capture_output=True, timeout=1.0)
+                        time.sleep(0.4)
+                        url = _forward_and_probe(adb, dev_id)
+                    if url:
+                        break
+        except Exception:
+            url = None
+    _LAST_USB_PROBE["url"] = url
+    return url
+
+
+def announced_url() -> str | None:
+    """把最新公告翻成可用地址：优先 UDP（15ms），UDP 不通就退回公告里的 HTTP 地址。
+
+    公告同时带了 TCP 与 UDP 端口，但早期版本只用 UDP 那个，http_url 存了从不读 ——
+    于是 AP 隔离 / 防火墙挡住 UDP 时，发现会返回一个永远连不通的 udp:// 地址。
+    """
+    udp_url, http_url = _ANNOUNCE.get("url"), _ANNOUNCE.get("http_url")
+    if udp_url:
+        host, port = parse_udp_url(udp_url)
+        if probe_udp(host, port, timeout=0.8):
+            return udp_url
+        debuglog.log("engine", f"UDP 不通（{udp_url}），退回公告里的 HTTP 地址 {http_url}")
+    return http_url or udp_url
 
 
 def resolve_url(explicit: str | None) -> str | None:
@@ -298,8 +509,10 @@ def resolve_url(explicit: str | None) -> str | None:
 
     t_start = time.time()
     if _ANNOUNCE["url"] and t_start - _ANNOUNCE["at"] < 5:
-        print(f"[发现] UDP 公告命中：{_ANNOUNCE['url']}", flush=True)
-        return _ANNOUNCE["url"]
+        hit = announced_url()
+        if hit:
+            print(f"[发现] UDP 公告命中：{hit}", flush=True)
+            return hit
 
     print("[发现] 正在寻找手机（USB/公告/上次地址/mDNS 并行）…", flush=True)
     send_udp_query()
@@ -328,8 +541,10 @@ def resolve_url(explicit: str | None) -> str | None:
             print(f"[发现] 上次地址仍可用：{box['last']}", flush=True)
             return box["last"]                      # IP 未变，最快路径
         if _ANNOUNCE["url"] and _ANNOUNCE["at"] >= t_start:
-            print(f"[发现] UDP 查询应答：{_ANNOUNCE['url']}", flush=True)
-            return _ANNOUNCE["url"]                  # 查询带回的新公告
+            hit = announced_url()                    # 查询带回的新公告
+            if hit:
+                print(f"[发现] UDP 查询应答：{hit}", flush=True)
+                return hit
         if box["mdns"]:
             print(f"[发现] mDNS 找到：{box['mdns']}", flush=True)
             return box["mdns"]
@@ -339,8 +554,10 @@ def resolve_url(explicit: str | None) -> str | None:
     if last:
         # 扫描前再查一次公告（等待循环结束到这里的间隙里手机可能刚好回来）
         if _ANNOUNCE["url"] and _ANNOUNCE["at"] >= t_start:
-            print(f"[发现] UDP 查询应答：{_ANNOUNCE['url']}", flush=True)
-            return _ANNOUNCE["url"]
+            hit = announced_url()
+            if hit:
+                print(f"[发现] UDP 查询应答：{hit}", flush=True)
+                return hit
         host = last.split("//")[-1].split(":")[0]
         url = scan_host_for_riff(host)
         if url:
@@ -350,10 +567,42 @@ def resolve_url(explicit: str | None) -> str | None:
     return None
 
 
-def probe_ok(url: str) -> bool:
+def probe_udp(host: str, port: int, timeout: float = 1.2) -> bool:
+    """向手机 UDP 音频端注册一次，收到 PMIC 包即判活，收尾时撤销注册。"""
+    s = None
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "PhoneMic/1.0"})
-        resp = DIRECT_OPENER.open(req, timeout=2)
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(timeout)
+        s.sendto(udp_start_payload(), (host, port))
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            data, _ = s.recvfrom(2048)
+            if len(data) >= 8 and data[:4] == b"PMIC":
+                return True
+    except Exception:
+        pass
+    finally:
+        if s is not None:
+            try:
+                s.sendto(b"PHONEMIC_UDP_STOP", (host, port))
+            except Exception:
+                pass
+            try:
+                s.close()
+            except Exception:
+                pass
+    return False
+
+
+def probe_ok(url: str, timeout: float = 2.0) -> bool:
+    # udp:// 也必须能探活：main() 会把它写进 .phonemic_last_url，
+    # 若这里只认 http，「上次地址」快车道在无线模式下永久失效
+    if url.startswith("udp://"):
+        return probe_udp(*parse_udp_url(url), timeout=min(timeout, 1.2))
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "PhoneMic/1.0", **auth_headers()})
+        resp = DIRECT_OPENER.open(req, timeout=timeout)
         head = resp.read(4)
         resp.close()
         return head == b"RIFF"
@@ -406,7 +655,7 @@ def gain_watcher():
         try:
             if GAIN_FILE.exists():
                 v = float(GAIN_FILE.read_text().strip() or 0)
-                GAIN_DB["v"] = max(0.0, min(18.0, v))
+                GAIN_DB["v"] = clamp_gain(v)
         except Exception:
             pass
         time.sleep(1)
@@ -451,6 +700,7 @@ class PttRecorder:
         self.ch, self.rate, self.bits = ch, rate, bits
         self.wav = None
         self.stamp = None
+        self.write_failed = False   # 落盘失败过：收尾时据此告警，别让用户以为录上了
         self._cache = (0.0, False)
         self._savers = []   # 在途的 WAV→FLAC 转码线程
 
@@ -489,13 +739,18 @@ class PttRecorder:
             if self.wav is not None:
                 try:
                     self.wav.writeframesraw(chunk)
-                except Exception:
-                    pass
+                except Exception as e:
+                    # 静默吞掉的话，磁盘满/权限问题会让录音变成空文件而用户毫不知情
+                    if not self.write_failed:
+                        self.write_failed = True
+                        print(f"[录音] ⚠️ 写入失败，本段可能不完整：{e}", flush=True)
+                        debuglog.log("engine", f"录音写入失败（{self.stamp}）：{e}", exc=True)
         elif self.wav is not None:
             self.close_segment()
 
     def close_segment(self) -> None:
         wav, stamp = self.wav, self.stamp
+        failed, self.write_failed = self.write_failed, False
         self.wav, self.stamp = None, None
         if wav is None:
             return
@@ -504,6 +759,8 @@ class PttRecorder:
             wav.close()
         except Exception:
             return
+        if failed:
+            print(f"[录音] ⚠️ {stamp} 期间有写入失败，存档可能缺片段", flush=True)
         if dur < PTT_MIN_SEGMENT:
             try:
                 (REC_DIR / f"{stamp}.wav").unlink()
@@ -583,7 +840,7 @@ class UdpAudioReceiver:
 
     def _send_ping(self):
         try:
-            self.sock.sendto(b"PHONEMIC_UDP_START", (self.host, self.port))
+            self.sock.sendto(udp_start_payload(), (self.host, self.port))
         except Exception:
             pass
 
@@ -621,19 +878,20 @@ class UdpAudioReceiver:
 
 def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
     if url.startswith("udp://"):
-        host_port = url[6:].split(":")
-        host = host_port[0]
-        port = int(host_port[1]) if len(host_port) > 1 else 58082
+        host, port = parse_udp_url(url)
         udp_rcv = UdpAudioReceiver(host, port, stop)
         resp = udp_rcv
         raw_resp = resp
         payload = b""
-        ch, rate, bits = 1, 48000, 16
+        # 采样率来自手机公告（parse_announce 的 RATE 字段），旧版手机缺省 48000。
+        # 早期版本这里硬编码 48000，手机端一改格式就会静默按错误采样率解码。
+        ch, rate, bits = 1, int(_ANNOUNCE.get("rate") or 48000), 16
         dtype = "int16"
-        print(f"[传输] 采用 UDP 极速低延迟模式 (目标={host}:{port})", flush=True)
-        debuglog.log("engine", f"启动 UDP 推流会话 (目标={host}:{port})")
+        print(f"[传输] 采用 UDP 极速低延迟模式 (目标={host}:{port} {rate}Hz)", flush=True)
+        debuglog.log("engine", f"启动 UDP 推流会话 (目标={host}:{port} {rate}Hz)")
     else:
-        req = urllib.request.Request(url, headers={"User-Agent": "PhoneMic/1.0"})
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "PhoneMic/1.0", **auth_headers()})
         # timeout 同时约束连接与每次 read：手机离开 WiFi 范围时不会有 TCP RST，
         # 靠这个读超时把"无限挂起"压到 3 秒内检测（正常流每 ~128ms 就有一块数据）
         resp = DIRECT_OPENER.open(req, timeout=3)
@@ -642,6 +900,12 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
         dtype = DTYPES.get(bits)
         if dtype is None:
             raise ValueError(f"不支持的位深 {bits}bit（请在手机端把音频格式设为 PCM 16bit）")
+    # 连上了才把地址写进缓存：写在尝试之前的话，失败的尝试也会污染
+    # 「上次可用地址」，菜单栏的链路面板也会跟着显示一条从未接通的链路
+    try:
+        LAST_URL_FILE.write_text(url)
+    except Exception:
+        pass
     t0 = time.time()
 
     # 录音存档（可选，PTT 模式）：只有按住右 Option 期间的音频才落盘；
@@ -652,7 +916,7 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
             REC_DIR.mkdir(parents=True, exist_ok=True)
             recorder = PttRecorder(ch, rate, bits)
             meta_fh = open(REC_DIR / f"{rec_stamp}.meta.csv", "w")
-            meta_fh.write("elapsed_sec,level_pct,underruns,clipped\n")
+            meta_fh.write("elapsed_sec,level_pct,underruns,limited\n")
             print("[录音] PTT 模式：按右⌥开始记录，再按结束并存档 FLAC", flush=True)
             debuglog.log("engine", f"录音器就绪：PTT 模式，指标文件 {rec_stamp}.meta.csv")
         except Exception as e:
@@ -685,8 +949,6 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
 
             def feeder():
                 try:
-                    if payload:
-                        ff.stdin.write(payload)
                     while not stop.is_set():
                         chunk = resp.read(4096)
                         if not chunk:
@@ -775,20 +1037,9 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
         data = rem[:need]
         del rem[:need]
         if dtype == "int16":
-            arr = np.frombuffer(data, dtype=dtype).astype(np.float32) * (10 ** (GAIN_DB["v"] / 20.0))
-            # 平滑软限幅器（Soft Limiter）：阈值 26000（约 -2dBFS），超过部分采用 tanh 平滑压缩，杜绝方波爆音与削波失真
-            threshold = 26000.0
-            limit = 32000.0
-            mask = np.abs(arr) > threshold
-            if np.any(mask):
-                excess = np.abs(arr[mask]) - threshold
-                max_excess = 32767.0 - threshold
-                compressed = threshold + (limit - threshold) * np.tanh(excess / (max_excess * 0.8))
-                arr[mask] = np.sign(arr[mask]) * compressed
-            np.clip(arr, -32768, 32767, out=arr)
-            stat["clipped"] = stat.get("clipped", 0) + int(np.count_nonzero(np.abs(arr) >= 32600))
-            peak = int(np.abs(arr).max()) * 100 // 32768
-            outdata[:] = arr.astype(dtype).reshape(frames, ch)
+            out, limited, peak = process_pcm16(bytes(data), GAIN_DB["v"])
+            stat["limited"] = stat.get("limited", 0) + limited
+            outdata[:] = out.reshape(frames, ch)
         else:
             peak = 0
             outdata[:] = np.frombuffer(data, dtype=dtype).reshape(frames, ch)
@@ -901,7 +1152,7 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
                 if meta_fh:
                     try:
                         meta_fh.write(f"{now - t0:.1f},{stat.get('peak', 0)},"
-                                      f"{stat['underruns']},{stat.get('clipped', 0)}\n")
+                                      f"{stat['underruns']},{stat.get('limited', 0)}\n")
                         meta_fh.flush()
                     except Exception:
                         pass
@@ -909,7 +1160,7 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
                 if now - last_report > 10:
                     last_report = now
                     print(f"[状态] 运行中 缓冲≈{buffered_ms:.0f}ms 峰值{stat.get('peak', 0)}% "
-                          f"欠载{stat['underruns']}次 削波{stat.get('clipped', 0)}次", flush=True)
+                          f"欠载{stat['underruns']}次 限幅{stat.get('limited', 0)}次", flush=True)
     finally:
         # 无论正常结束还是异常/SIGTERM 退出，录音段都要正确收尾（回写头部长度）
         if recorder:
@@ -989,11 +1240,7 @@ def main():
             if not url:
                 wait_interruptible(2, "[发现] 2 秒后重新寻找手机…")
                 continue
-            if fails == 0 or args.auto:
-                try:
-                    LAST_URL_FILE.write_text(url)
-                except Exception:
-                    pass
+            # 地址缓存由 stream_once 在真正连上之后写，见那里的注释
             t_stream = time.time()
             debuglog.log("engine", f"尝试连接 {url}（第 {fails + 1} 次尝试）")
             try:

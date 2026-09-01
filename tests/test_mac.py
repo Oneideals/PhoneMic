@@ -15,6 +15,16 @@ ENGINE = BASE / "phonemic.py"
 PY = str(BASE / ".venv" / "bin" / "python")
 sys.path.insert(0, str(BASE))
 
+# 关掉 USB 探测：不然本机插着的真手机会被优先选中，测试转而连真设备，
+# 假手机那几条断言就会以"15s 内未重连"的形式莫名其妙地失败。
+# 公告/查询端口也挪开：58080 是系统级资源，同机跑着的另一个 PhoneMic
+# 会把公告整包吃掉（SO_REUSEADDR 只保证 bind 成功，不保证收得到）。
+ANNOUNCE_PORT = 58880
+QUERY_PORT = 58881
+ENV = {**os.environ, "PHONEMIC_NO_USB": "1",
+       "PHONEMIC_ANNOUNCE_PORT": str(ANNOUNCE_PORT),
+       "PHONEMIC_QUERY_PORT": str(QUERY_PORT)}
+
 PASS, FAIL = [], []
 
 
@@ -56,11 +66,11 @@ def test_wav_header():
 
 def test_lock():
     p1 = subprocess.Popen([PY, str(ENGINE), "http://127.0.0.1:1"],
-                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=ENV)
     time.sleep(1.5)   # 等第一个进程完成 acquire_lock
     try:
         p2 = subprocess.run([PY, str(ENGINE), "http://127.0.0.1:1"],
-                            capture_output=True, text=True, timeout=15)
+                            capture_output=True, text=True, timeout=15, env=ENV)
         check("单实例锁: 第二个实例被拒绝", "已有 PhoneMic 实例" in p2.stdout, p2.stdout[-200:])
     finally:
         p1.send_signal(signal.SIGTERM)
@@ -76,7 +86,7 @@ class FakePhone(threading.Thread):
     """模拟手机端：无限 48k/16bit/mono WAV 流，供引擎拉取。
 
     announce=True 时复刻真机 UDP 公告行为：无客户端连接期间每 0.5s 向
-    127.0.0.1:58080 广播 'PHONEMIC <port>'（真机是 255.255.255.255，测试走环回）。
+    127.0.0.1:ANNOUNCE_PORT 广播 'PHONEMIC <port>'（真机是 255.255.255.255，测试走环回）。
     """
 
     def __init__(self, port, announce=True):
@@ -107,7 +117,7 @@ class FakePhone(threading.Thread):
         while not self.stop_flag.is_set():
             if self.clients == 0:
                 try:
-                    s.sendto(f"PHONEMIC {self.port}".encode(), ("127.0.0.1", 58080))
+                    s.sendto(f"PHONEMIC {self.port}".encode(), ("127.0.0.1", ANNOUNCE_PORT))
                 except OSError:
                     pass
             time.sleep(0.5)
@@ -151,7 +161,8 @@ class FakePhone(threading.Thread):
 
 def run_engine(url, wait_for="[音频]", timeout=25):
     p = subprocess.Popen([PY, str(ENGINE), url],
-                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                         bufsize=1, env=ENV)
     t0 = time.time()
     lines = []
     while time.time() - t0 < timeout:

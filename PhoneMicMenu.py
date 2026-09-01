@@ -12,6 +12,7 @@ import media_ducking
 import rumps
 
 import debuglog
+import phonemic   # 复用引擎侧的链路标签/增益上限/配对 token，避免两处各写一份而漂移
 
 BASE = Path(__file__).resolve().parent   # 项目根（脚本所在目录），保证 clone 到任意位置都能运行
 ENGINE = BASE / "phonemic.py"
@@ -31,7 +32,7 @@ SYSINPUT_FILE = BASE / "sysinput"           # 接管系统输入开关（"1"=接
 PREV_INPUT_FILE = BASE / ".prev_input"      # 接管前的原输入设备名（用于还原）
 BLACKHOLE_NAME = "BlackHole 2ch"
 SWITCH_TOOL = "/opt/homebrew/bin/SwitchAudioSource"
-GAIN_CHOICES = [0, 3, 6, 9, 12]
+GAIN_CHOICES = [0, 3, 6, 9, 12, 15, 18]     # 上限与 phonemic.MAX_GAIN_DB / 手机端保持一致
 RIGHT_OPTION_KEYCODE = 61                   # 右 Option 键码（调试用）
 NX_DEVICERALTKEYMASK = 0x0040               # 右 Option 的设备修饰位（IOLLEvent.h: NX_DEVICERALTKEYMASK）
 LOCK_FILE = BASE / ".phonemic_lock"         # 引擎单实例锁（内容为引擎 PID）
@@ -118,12 +119,27 @@ def _play_sound(sound_name: str = "Basso"):
         pass
 
 
+def notify_argv(title: str, message: str, sound: str = None) -> list:
+    """构造 osascript 命令行：文案走 `on run` 参数，不拼进脚本正文。
+
+    直接 f-string 拼接的话，文案里的引号会破坏脚本，`" & (do shell script "…")`
+    这类内容还能直接注入执行。现在调用点都是常量，但这个函数迟早会被喂上
+    设备名或 URL，参数化是唯一不用每次提心吊胆的写法。
+    """
+    body = "display notification m with title t"
+    if sound:
+        body += " sound name s"
+    return ["osascript",
+            "-e", "on run {t, m, s}",
+            "-e", body,
+            "-e", "end run",
+            "--", title, message, sound or ""]
+
+
 def _show_notification(title: str, message: str, sound: str = None):
     try:
-        script = f'display notification "{message}" with title "{title}"'
-        if sound:
-            script += f' sound name "{sound}"'
-        subprocess.Popen(["osascript", "-e", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen(notify_argv(title, message, sound),
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
 
@@ -227,10 +243,37 @@ TEXTS = {
 }
 
 
+def _ensure_edit_menu():
+    """为无 Dock 图标的菜单栏应用注入标准 Edit 菜单（⌘C/⌘V/⌘A/⌘X/⌘Z）。
+
+    macOS 输入框快捷键依赖 NSApp.mainMenu 中的 Edit 子菜单；
+    Accessory 辅助型应用默认无 mainMenu，会导致输入框无法使用 ⌘V 粘贴。
+    """
+    import AppKit
+
+    app = AppKit.NSApplication.sharedApplication()
+    if app.mainMenu() is not None:
+        return
+    main_menu = AppKit.NSMenu.alloc().init()
+    edit_item = AppKit.NSMenuItem.alloc().init()
+    edit_menu = AppKit.NSMenu.alloc().initWithTitle_("Edit")
+    edit_menu.addItem_(AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Undo", "undo:", "z"))
+    edit_menu.addItem_(AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Redo", "redo:", "Z"))
+    edit_menu.addItem_(AppKit.NSMenuItem.separatorItem())
+    edit_menu.addItem_(AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Cut", "cut:", "x"))
+    edit_menu.addItem_(AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Copy", "copy:", "c"))
+    edit_menu.addItem_(AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Paste", "paste:", "v"))
+    edit_menu.addItem_(AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Select All", "selectAll:", "a"))
+    edit_item.setSubmenu_(edit_menu)
+    main_menu.addItem_(edit_item)
+    app.setMainMenu_(main_menu)
+
+
 class PhoneMicMenu(rumps.App):
 
     def __init__(self):
         debuglog.install("menu")
+        _ensure_edit_menu()
         super().__init__(name="PhoneMic", quit_button="退出 PhoneMic")
         self.paths = build_icons()
         self.icon = self.paths["stopped"]
@@ -259,6 +302,7 @@ class PhoneMicMenu(rumps.App):
         self._last_logged_status = None
         self.item_open_rec = rumps.MenuItem("打开录音文件夹", callback=self.on_open_rec)
         self.item_reconnect = rumps.MenuItem("立即重连手机", callback=self.on_reconnect)
+        self.item_pair = rumps.MenuItem("配对：检查中…", callback=self.on_pair)
         self.item_sys = rumps.MenuItem("接管系统输入（断线自动还原）", callback=self.on_sysinput)
         self.item_sys.state = self._flag_on(SYSINPUT_FILE)
         self._sys_switched = False
@@ -280,7 +324,7 @@ class PhoneMicMenu(rumps.App):
             None,
             self.item_ptt,
             self.item_duck, self.item_denoise, self.item_rec, self.item_open_rec,
-            self.item_sys, self.item_reconnect,
+            self.item_sys, self.item_pair, self.item_reconnect,
             self.item_toggle, self.item_autostart, None
         ]
         self.sync_gain_state()
@@ -556,6 +600,55 @@ class PhoneMicMenu(rumps.App):
         except Exception:
             pass
 
+    def on_pair(self, sender):
+        """手动配对：输入手机 App 上显示的配对码。
+
+        插过 USB 线的话引擎会自动配对，这里只服务于「从没插过线、纯无线」的场景。
+        """
+        import AppKit
+
+        cur = phonemic.load_token()
+        try:
+            _ensure_edit_menu()
+            app = AppKit.NSApplication.sharedApplication()
+            app.activateIgnoringOtherApps_(True)
+
+            alert = AppKit.NSAlert.alloc().init()
+            alert.setMessageText_("PhoneMic 配对")
+            alert.setInformativeText_(
+                "打开手机上的 PhoneMic，把界面显示的「配对码」输入到这里。\n"
+                "（插过 USB 数据线会自动配对，无需手动输入）\n"
+                "若要解除配对，清空输入框点击保存即可。"
+            )
+            alert.addButtonWithTitle_("保存")
+            alert.addButtonWithTitle_("取消")
+
+            field = AppKit.NSTextField.alloc().initWithFrame_(AppKit.NSMakeRect(0, 0, 280, 24))
+            field.setStringValue_(cur or "")
+            alert.setAccessoryView_(field)
+
+            win = alert.window()
+            win.setLevel_(AppKit.NSFloatingWindowLevel)
+            win.setInitialFirstResponder_(field)
+            win.makeKeyAndOrderFront_(None)
+            # 窗口渲染完成后延迟触发全选，确保 FieldEditor 绑定完毕并高亮全选当前配对码
+            field.performSelector_withObject_afterDelay_("selectText:", None, 0.05)
+
+            res = alert.runModal()
+            if res != AppKit.NSAlertFirstButtonReturn:
+                return  # 取消或关闭
+            field.validateEditing()
+            tok = str(field.stringValue()).strip()
+        except Exception as e:
+            debuglog.log("menu", f"配对弹窗异常: {e}")
+            return
+
+        phonemic.save_token(tok)
+        debuglog.log("menu", f"手动配对：{'已保存配对码' if tok else '已解除配对'}")
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()   # 让引擎带着新 token 重连
+        self.refresh()
+
     def on_autostart(self, sender):
         try:
             if AGENT.exists():
@@ -577,6 +670,10 @@ class PhoneMicMenu(rumps.App):
         return self.status == "streaming" and self._flag_on(RECORD_FILE) == 1
 
     def refresh(self):
+        # 配对状态
+        self.item_pair.title = ("配对：✅ 已配对（点此修改）" if phonemic.load_token()
+                                else "配对：⚠️ 未配对（插 USB 线自动配对，或点此手填）")
+
         # PTT 监听状态显示
         if self.ptt_error:
             self.item_ptt.title = f"⚠️ PTT：{self.ptt_error}"
@@ -639,12 +736,7 @@ class PhoneMicMenu(rumps.App):
                     last_url = LAST_URL_FILE.read_text().strip()
             except Exception:
                 pass
-            if "127.0.0.1" in last_url:
-                mode_tag = "⚡ USB 物理直连 (<1ms 极速)"
-            elif last_url.startswith("udp://"):
-                mode_tag = "📡 UDP 极速无线流 (15ms 低延迟)"
-            else:
-                mode_tag = "📶 Wi-Fi 局域网流 (40ms)"
+            mode_tag = phonemic.link_mode_label(last_url) or "🔍 探测中…"
             self.item_status.title = "● 手机麦克风已连通" + status_tag
             self.item_mode.title = f"传输链路：{mode_tag}"
 
