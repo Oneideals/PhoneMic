@@ -39,6 +39,7 @@ _kAudioObjectSystemObject = 1
 _kAudioObjectPropertyScopeGlobal = 0x676C6F62           # 'glob'
 _kAudioObjectPropertyScopeOutput = 0x6F757470           # 'outp'
 _kAudioDevicePropertyMute = 0x6D757465                  # 'mute'
+_kAudioDevicePropertyVolumeScalar = 0x766F6C6D          # 'volm'
 _kAudioObjectPropertyElementMain = 0                    # 0
 
 
@@ -64,6 +65,55 @@ def get_default_output_device_id() -> Optional[int]:
         return dev_id.value if status == 0 else None
     except Exception:
         return None
+
+
+def poke_system_volume() -> bool:
+    """唤醒并刷新系统默认输出设备的音量管线（触发 VolumeScalar 硬件事件，唤醒 Boom 3D / 外接 USB DAC）。"""
+    success = False
+    dev_id = get_default_output_device_id()
+    if dev_id and _core_audio:
+        for elem in [_kAudioObjectPropertyElementMain, 1, 2]:
+            try:
+                addr = _AudioObjectPropertyAddress(
+                    _kAudioDevicePropertyVolumeScalar,
+                    _kAudioObjectPropertyScopeOutput,
+                    elem,
+                )
+                vol = ctypes.c_float(0.0)
+                size = ctypes.c_uint32(ctypes.sizeof(vol))
+                status = _core_audio.AudioObjectGetPropertyData(
+                    dev_id,
+                    ctypes.byref(addr),
+                    0,
+                    None,
+                    ctypes.byref(size),
+                    ctypes.byref(vol),
+                )
+                if status == 0 and size.value == ctypes.sizeof(vol):
+                    set_status = _core_audio.AudioObjectSetPropertyData(
+                        dev_id,
+                        ctypes.byref(addr),
+                        0,
+                        None,
+                        size,
+                        ctypes.byref(vol),
+                    )
+                    if set_status == 0:
+                        success = True
+            except Exception:
+                pass
+    if not success:
+        # 兜底 AppleScript 广播当前音量以激活声卡管线
+        try:
+            subprocess.run(
+                ["osascript", "-e", "set volume output volume (output volume of (get volume settings))"],
+                capture_output=True,
+                timeout=0.2,
+            )
+            success = True
+        except Exception:
+            pass
+    return success
 
 
 def get_system_mute() -> bool:
@@ -142,6 +192,11 @@ def set_system_mute(mute: bool) -> bool:
             success = True
         except Exception:
             pass
+
+    # 解除静音时，唤醒并同步音量管线（防止 Boom 3D / USB DAC 处于休眠或增益为 0 状态）
+    if not mute:
+        poke_system_volume()
+
     return success
 
 
