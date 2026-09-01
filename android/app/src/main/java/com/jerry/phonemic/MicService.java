@@ -39,7 +39,7 @@ public class MicService extends Service {
 
     public static String getActiveLinkMode() {
         if (!RUNNING) return "○ 服务未启动";
-        if (HAS_USB_LINK) return "⚡ USB 物理直连 (<1ms 极速)";
+        if (HAS_USB_LINK || !usbClients.isEmpty()) return "⚡ USB 物理直连 (<1ms 极速)";
         if (!udpClients.isEmpty()) return "📡 UDP 极速无线流 (15ms 低延迟)";
         if (!clients.isEmpty()) return "📶 Wi-Fi 局域网传输中 (40ms)";
         return "⏸ 待机中（等待电脑连接，USB / Wi-Fi 已就绪）";
@@ -47,7 +47,7 @@ public class MicService extends Service {
 
     public static String getActiveLinkDetail() {
         if (!RUNNING) return "请点击下方「启动麦克风服务」";
-        if (HAS_USB_LINK) return "已通过 USB 数据线直连电脑，延迟 <1ms，零网络抖动";
+        if (HAS_USB_LINK || !usbClients.isEmpty()) return "已通过 USB 数据线直连电脑，延迟 <1ms，零网络抖动";
         if (!udpClients.isEmpty()) return "已建立 UDP 10ms 极速无线推流，无 TCP 队头阻塞";
         if (!clients.isEmpty()) return "正在通过 Wi-Fi 局域网传输音频流";
         return "电脑端打开 PhoneMic 即可自动秒连（插线走 USB，拔线走 UDP）";
@@ -61,6 +61,7 @@ public class MicService extends Service {
     public static final int UDP_AUDIO_PORT = 58082;
 
     private static final CopyOnWriteArrayList<OutputStream> clients = new CopyOnWriteArrayList<>();
+    private static final CopyOnWriteArrayList<OutputStream> usbClients = new CopyOnWriteArrayList<>();
     private static final java.util.concurrent.ConcurrentHashMap<java.net.InetSocketAddress, Long> udpClients =
             new java.util.concurrent.ConcurrentHashMap<>();
     private java.net.DatagramSocket udpAudioSocket;
@@ -94,6 +95,8 @@ public class MicService extends Service {
         try { if (serverSocket != null) serverSocket.close(); } catch (Exception ignored) {}
         try { if (udpAudioSocket != null) udpAudioSocket.close(); } catch (Exception ignored) {}
         udpClients.clear();
+        usbClients.clear();
+        HAS_USB_LINK = false;
         for (OutputStream c : clients) { try { c.close(); } catch (Exception ignored) {} }
         clients.clear();
         super.onDestroy();
@@ -367,10 +370,9 @@ public class MicService extends Service {
         boolean isUsb = false;
         try {
             String remote = s.getInetAddress() != null ? s.getInetAddress().getHostAddress() : "";
-            if ("127.0.0.1".equals(remote) || "localhost".equals(remote) || "::1".equals(remote)) {
-                isUsb = true;
-                HAS_USB_LINK = true;
-            }
+            isUsb = s.getInetAddress() != null && (s.getInetAddress().isLoopbackAddress()
+                    || remote.contains("127.0.0.1") || remote.equals("::1") || "localhost".equalsIgnoreCase(remote));
+            android.util.Log.i("PhoneMic.Svc", ">>> serve: remote=" + remote + " isUsb=" + isUsb);
             s.setTcpNoDelay(true);
             s.setSoTimeout(10000);   // 握手超时：不发请求的连接不会永久占住线程
             InputStream in = s.getInputStream();
@@ -387,11 +389,20 @@ public class MicService extends Service {
             out.write(WAV_HEADER);
             out.flush();
             clients.add(out);
+            if (isUsb) {
+                usbClients.add(out);
+                HAS_USB_LINK = true;
+            }
             while (running && clients.contains(out)) Thread.sleep(1000);
         } catch (Exception ignored) {
         } finally {
-            if (isUsb) HAS_USB_LINK = false;
-            clients.remove(out);
+            if (out != null) {
+                clients.remove(out);
+                if (isUsb) {
+                    usbClients.remove(out);
+                    HAS_USB_LINK = !usbClients.isEmpty();
+                }
+            }
             try { s.close(); } catch (Exception ignored) {}
         }
     }

@@ -798,48 +798,25 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
     t.start()
 
     def watchdog():
-        """每 5 秒体检一次：区分「没数据」和「声卡回调卡死」，卡死时打印线程栈。"""
+        """每 2 秒体检一次：检测 USB 插入无缝升级、信号文件、断流超时与声卡卡死。"""
         warned_data = warned_cb = False
         while not stop.is_set() and t.is_alive():
-            time.sleep(5)
+            time.sleep(2)
             if stop.is_set():
                 return
-            now = time.time()
-            since_data, since_cb = now - hb["data"], now - hb["cb"]
-            buffered = q.qsize() * 4096 / byte_rate * 1000
-            if not hb["cb_started"]:
-                # 会话启动阶段（发现手机→建流→开 OutputStream 都在首次回调之前），
-                # 此时"尚无回调"属正常，不能误判为停摆；超过 15s 才算真异常
-                waited = now - hb["t_start"]
-                if waited > 15:
-                    debuglog.log("engine",
-                                 f"⚠️ 会话已启动 {waited:.0f}s 但声卡从未回调"
-                                 f"（源={hb['src']} 缓冲{buffered:.0f}ms "
-                                 f"producer存活={t.is_alive()}）")
-                    debuglog.dump_thread("engine", t.ident, "producer")
-                continue
-            if since_data > 5 or since_cb > 2:
-                debuglog.log("engine",
-                             f"⚠️ 异常：无数据 {since_data:.1f}s / 回调停滞 {since_cb:.1f}s "
-                             f"（源={hb['src']} 缓冲{buffered:.0f}ms 峰值{stat.get('peak', 0)}% "
-                             f"欠载{stat['underruns']} 回调数{hb['cb_count']} "
-                             f"producer存活={t.is_alive()}）")
-                if since_data > 8 and not warned_data:
-                    warned_data = True
-                    debuglog.dump_thread("engine", t.ident, "producer")
-                if since_cb > 3 and not warned_cb:
-                    warned_cb = True
-                    debuglog.log("engine",
-                                 "声卡回调停摆：PortAudio 未再调用 callback"
-                                 "（常见原因：系统睡眠唤醒后设备失效 / 设备被切换 / 输出设备被占用）")
-                continue
-            warned_data = warned_cb = False
-            debuglog.log("engine",
-                         f"心跳正常：缓冲{buffered:.0f}ms 峰值{stat.get('peak', 0)}% "
-                         f"欠载{stat['underruns']} 回调{hb['cb_count']}/5s "
-                         f"累计{stat['bytes'] // 1024}KB 源={hb['src']}")
 
-            # 运行期间热插拔升级：若当前走无线网络且用户插上了 USB 线，无缝热升级至 USB 直连模式
+            # 1. 响应菜单栏「立即重连」信号
+            if RECONNECT_FILE.exists():
+                try:
+                    RECONNECT_FILE.unlink()
+                except Exception:
+                    pass
+                debuglog.log("engine", "watchdog 消费立即重连信号，主动中断当前会话")
+                print("\n[连接] 收到立即重连信号，正在重新发现手机…", flush=True)
+                stop.set()
+                return
+
+            # 2. 运行期间 USB 热插拔无缝升级：无线流下插入 USB 线立即切到 USB 直连
             if not url.startswith("http://127.0.0.1:"):
                 now_usb = check_usb_device()
                 if now_usb:
@@ -847,6 +824,51 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
                     debuglog.log("engine", "检测到 USB 插入，触发升级至 USB 极速模式")
                     stop.set()
                     return
+
+            now = time.time()
+            since_data, since_cb = now - hb["data"], now - hb["cb"]
+            buffered = q.qsize() * 4096 / byte_rate * 1000
+
+            if not hb["cb_started"]:
+                waited = now - hb["t_start"]
+                if waited > 15:
+                    debuglog.log("engine",
+                                 f"⚠️ 会话已启动 {waited:.0f}s 但声卡从未回调"
+                                 f"（源={hb['src']} 缓冲{buffered:.0f}ms "
+                                 f"producer存活={t.is_alive()}）")
+                    debuglog.dump_thread("engine", t.ident, "producer")
+                    stop.set()
+                    return
+                continue
+
+            # 3. 声卡驱动回调停摆检测（睡眠唤醒/声卡被卸载）
+            if since_cb > 4:
+                debuglog.log("engine", f"⚠️ 声卡回调停摆 {since_cb:.1f}s，主动重置声卡输出流")
+                print("\n[音频] 声卡回调停摆，自动重建声卡输出…", flush=True)
+                stop.set()
+                return
+
+            # 4. 音频流断流熔断：手机离线或读阻塞超过 6 秒，主动断开触发重连
+            if since_data > 6:
+                debuglog.log("engine",
+                             f"⚠️ 断流超时：无数据 {since_data:.1f}s "
+                             f"（源={hb['src']} 缓冲{buffered:.0f}ms 峰值{stat.get('peak', 0)}% "
+                             f"欠载{stat['underruns']} producer存活={t.is_alive()}），主动熔断重连")
+                print(f"\n[连接] 超过 {since_data:.1f}s 未收到音频，自动重新寻找手机…", flush=True)
+                stop.set()
+                return
+
+            if since_data > 3:
+                debuglog.log("engine",
+                             f"⚠️ 抖动预警：无数据 {since_data:.1f}s "
+                             f"（源={hb['src']} 缓冲{buffered:.0f}ms 峰值{stat.get('peak', 0)}%）")
+                continue
+
+            warned_data = warned_cb = False
+            debuglog.log("engine",
+                         f"心跳正常：缓冲{buffered:.0f}ms 峰值{stat.get('peak', 0)}% "
+                         f"欠载{stat['underruns']} 回调{hb['cb_count']} "
+                         f"累计{stat['bytes'] // 1024}KB 源={hb['src']}")
 
     threading.Thread(target=watchdog, daemon=True).start()
 
@@ -862,6 +884,15 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
             last_report = 0.0
             while not stop.is_set() and t.is_alive():
                 time.sleep(0.5)
+                if RECONNECT_FILE.exists():
+                    try:
+                        RECONNECT_FILE.unlink()
+                    except Exception:
+                        pass
+                    debuglog.log("engine", "收到立即重连信号，主动中断当前推流")
+                    print("\n[连接] 收到立即重连信号，正在重新寻找手机…", flush=True)
+                    stop.set()
+                    break
                 now = time.time()
                 try:
                     LEVEL_FILE.write_text(str(stat.get("peak", 0)))

@@ -35,6 +35,7 @@ GAIN_CHOICES = [0, 3, 6, 9, 12]
 RIGHT_OPTION_KEYCODE = 61                   # 右 Option 键码（调试用）
 NX_DEVICERALTKEYMASK = 0x0040               # 右 Option 的设备修饰位（IOLLEvent.h: NX_DEVICERALTKEYMASK）
 LOCK_FILE = BASE / ".phonemic_lock"         # 引擎单实例锁（内容为引擎 PID）
+LAST_URL_FILE = BASE / ".phonemic_last_url" # 最新连通 URL 文件
 
 PLIST = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -49,17 +50,17 @@ PLIST = f"""<?xml version="1.0" encoding="UTF-8"?>
 
 
 def build_icons():
-    """生成四种状态圆点图标：recording红/on白/connecting环/stopped暗环。"""
+    """生成四种状态圆点图标：recording绿/on蓝/connecting橙环/stopped暗环。"""
     import AppKit
 
     ICON_DIR.mkdir(parents=True, exist_ok=True)
     size = 18
     paths = {}
     specs = {
-        "recording": ("fill", (0.20, 0.85, 0.35, 1.0)),
-        "on": ("fill", (1.0, 1.0, 1.0, 1.0)),
-        "connecting": ("ring", (1.0, 1.0, 1.0, 0.9)),
-        "stopped": ("ring", (1.0, 1.0, 1.0, 0.45)),
+        "recording": ("fill", (0.15, 0.85, 0.35, 1.0)),     # 🟢 录音/语音输入锁定：亮绿实心圆
+        "on": ("fill", (0.20, 0.60, 1.0, 1.0)),            # 🔵 连通待命：清澈亮天蓝实心圆（常驻显色）
+        "connecting": ("ring", (0.96, 0.60, 0.15, 0.95)),  # 🟠 探测寻找中：亮橙色空心圆环
+        "stopped": ("ring", (0.55, 0.55, 0.55, 0.50)),      # ⭕ 手动停止：暗灰色空心圆环
     }
     for kind, (mode, color) in specs.items():
         img = AppKit.NSImage.alloc().initWithSize_((size, size))
@@ -236,6 +237,7 @@ class PhoneMicMenu(rumps.App):
         self.proc = None
         self.should_run = False
         self.status = "stopped"
+        self.speaking_until = 0.0
         self.level_hist = []
         self.ducker = media_ducking.AudioDucker(
             enabled_getter=lambda: self._flag_on(DUCK_FILE, default=1) == 1
@@ -417,10 +419,12 @@ class PhoneMicMenu(rumps.App):
             if self.status != "streaming":
                 _play_sound("Basso")
                 _show_notification("PhoneMic 未连通", "手机麦克风未连通（正在寻找中），语音输入暂不可用", sound="Basso")
+                self.refresh()
                 return
             self.ducker.duck()
         else:
             self.ducker.unduck()
+        self.refresh()
 
     # ---------- 菜单动作 ----------
 
@@ -620,8 +624,15 @@ class PhoneMicMenu(rumps.App):
             self.item_mode.title = "传输链路：⏸ 已停止"
             self.item_level.title = "电平诊断：--"
         elif self.status == "streaming":
-            live = self.recording_on() and self.ptt_active   # 录音开启且开关激活才录
-            self.icon = self.paths["recording" if live else "on"]
+            try:
+                lv = int(LEVEL_FILE.read_text().strip() or 0)
+            except Exception:
+                lv = 0
+
+            is_recording = self.ptt_active
+            self.icon = self.paths["recording" if is_recording else "on"]
+            status_tag = "（🎤 录音中）" if is_recording else ""
+
             last_url = ""
             try:
                 if LAST_URL_FILE.exists():
@@ -634,13 +645,9 @@ class PhoneMicMenu(rumps.App):
                 mode_tag = "📡 UDP 极速无线流 (15ms 低延迟)"
             else:
                 mode_tag = "📶 Wi-Fi 局域网流 (40ms)"
-            self.item_status.title = "● 手机麦克风已连通" + ("（🎤录音中）" if live else "")
+            self.item_status.title = "● 手机麦克风已连通" + status_tag
             self.item_mode.title = f"传输链路：{mode_tag}"
 
-            try:
-                lv = int(LEVEL_FILE.read_text().strip() or 0)
-            except Exception:
-                lv = 0
             self.level_hist.append(lv)
             if len(self.level_hist) > 15:
                 self.level_hist = self.level_hist[-15:]
@@ -718,6 +725,6 @@ if __name__ == "__main__":
     def ticker(_):
         app.refresh()
 
-    timer = rumps.Timer(ticker, 1)
+    timer = rumps.Timer(ticker, 0.25)
     timer.start()
     app.run()
