@@ -110,11 +110,22 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
-def _play_sound(sound_name: str = "Basso"):
+def _play_sound(sound_name: str = "Sosumi"):
+    """播放 macOS 原生系统提示音（AppKit NSSound 优先，系统音频服务直发）。"""
+    try:
+        import AppKit
+        snd = AppKit.NSSound.soundNamed_(sound_name)
+        if snd:
+            snd.setVolume_(1.0)
+            if snd.play():
+                return
+    except Exception:
+        pass
     try:
         path = f"/System/Library/Sounds/{sound_name}.aiff"
         if os.path.exists(path):
-            subprocess.Popen(["afplay", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.Popen(["afplay", "-v", "1.0", path],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
 
