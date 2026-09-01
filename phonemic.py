@@ -1245,7 +1245,9 @@ def main():
             debuglog.log("engine", f"尝试连接 {url}（第 {fails + 1} 次尝试）")
             try:
                 stream_once(url, out_idx, stop)
-                return
+                # stream_once 结束（如手机端重载或断流），重置计数并继续循环自动发现重连
+                fails = 0
+                time.sleep(0.5)
             except KeyboardInterrupt:
                 stop.set()
                 print("\n已退出", flush=True)

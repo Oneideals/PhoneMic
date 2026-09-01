@@ -465,8 +465,10 @@ class PhoneMicMenu(rumps.App):
                 _show_notification("PhoneMic 未连通", "手机麦克风未连通（正在寻找中），语音输入暂不可用", sound="Basso")
                 self.refresh()
                 return
+            _play_sound("Pop")
             self.ducker.duck()
         else:
+            _play_sound("Tink")
             self.ducker.unduck()
         self.refresh()
 
@@ -702,10 +704,10 @@ class PhoneMicMenu(rumps.App):
                                  f"（.level 新鲜={'是' if self.should_run and self.status == 'streaming' else '否'}）")
             if self._last_logged_status == "streaming" and self.status == "connecting":
                 _play_sound("Sosumi")
-                _show_notification("PhoneMic 断开连接", "手机麦克风已断开，正在自动寻找重连…", sound="Sosumi")
-            elif self._last_logged_status in ("connecting", None) and self.status == "streaming" and self._last_logged_status is not None:
+                _show_notification("PhoneMic 断开连接", "手机麦克风已断开，已自动还原为 Mac 自带麦克风", sound="Sosumi")
+            elif self._last_logged_status in ("connecting", None) and self.status == "streaming":
                 _play_sound("Glass")
-                _show_notification("PhoneMic 已连通", "手机麦克风已就绪，可按右⌥进行语音输入", sound="Glass")
+                _show_notification("PhoneMic 已连通", "手机麦克风已就绪，已接管系统音频输入", sound="Glass")
             self._last_logged_status = self.status
 
         # 系统输入接管：连通即接管，断线/停止自动还原

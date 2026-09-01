@@ -337,6 +337,9 @@ public class MicService extends Service {
                         for (java.util.Map.Entry<java.net.InetSocketAddress, Long> entry : udpClients.entrySet()) {
                             if (nowWall - entry.getValue() > 8000) {
                                 udpClients.remove(entry.getKey());
+                                if (clients.isEmpty() && udpClients.isEmpty()) {
+                                    onClientDisconnected();
+                                }
                                 continue;
                             }
                             try {
@@ -430,13 +433,18 @@ public class MicService extends Service {
                             String given = msg.contains(" ")
                                     ? msg.substring(msg.indexOf(' ') + 1).trim() : "";
                             if (tokenOk(given)) {
+                                boolean wasEmpty = clients.isEmpty() && udpClients.isEmpty();
                                 udpClients.put(from, System.currentTimeMillis());
+                                if (wasEmpty) onClientConnected(false);
                             } else if (udpRejectLog++ % 20 == 0) {
                                 android.util.Log.w("PhoneMic.Svc",
                                         "拒绝未配对的 UDP 注册: " + from);
                             }
                         } else if (msg.startsWith("PHONEMIC_UDP_STOP")) {
                             udpClients.remove(from);
+                            if (clients.isEmpty() && udpClients.isEmpty()) {
+                                onClientDisconnected();
+                            }
                         }
                     } catch (java.net.SocketTimeoutException ignored) {
                     } catch (Exception ignored) {}
@@ -575,9 +583,11 @@ public class MicService extends Service {
                     .getBytes("ISO-8859-1"));
             out.write(WAV_HEADER);
             out.flush();
+            boolean wasEmpty = clients.isEmpty() && udpClients.isEmpty();
             client = new Client(s, out, isUsb);
             clients.add(client);
             if (isUsb) HAS_USB_LINK = true;
+            if (wasEmpty) onClientConnected(isUsb);
             client.pump();           // 阻塞在本客户端自己的线程上，与采集线程无关
         } catch (Exception ignored) {
         } finally {
@@ -587,6 +597,9 @@ public class MicService extends Service {
                     android.util.Log.w("PhoneMic.Svc", "客户端断开，累计丢帧 " + client.dropped);
                 }
                 if (client.usb) HAS_USB_LINK = hasUsbClient();
+                if (clients.isEmpty() && udpClients.isEmpty()) {
+                    onClientDisconnected();
+                }
             }
             try { s.close(); } catch (Exception ignored) {}
         }
@@ -614,14 +627,73 @@ public class MicService extends Service {
         return o.toByteArray();
     }
 
+    private void onClientConnected(boolean isUsb) {
+        try {
+            // 1. 震动反馈 (轻快连击 2 下)
+            android.os.Vibrator v = (android.os.Vibrator) getSystemService(VIBRATOR_SERVICE);
+            if (v != null && v.hasVibrator()) {
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                    v.vibrate(android.os.VibrationEffect.createWaveform(new long[]{0, 50, 70, 70}, -1));
+                } else {
+                    v.vibrate(new long[]{0, 50, 70, 70}, -1);
+                }
+            }
+            // 2. 播放系统提示音
+            android.net.Uri sound = android.media.RingtoneManager.getDefaultUri(android.media.RingtoneManager.TYPE_NOTIFICATION);
+            if (sound != null) {
+                android.media.Ringtone r = android.media.RingtoneManager.getRingtone(getApplicationContext(), sound);
+                if (r != null) r.play();
+            }
+            // 3. 更新前台通知
+            updateNotification("PhoneMic 已连通", isUsb ? "⚡ USB 物理直连推流中" : "📡 无线推流中");
+        } catch (Exception ignored) {}
+    }
+
+    private void onClientDisconnected() {
+        try {
+            // 1. 震动反馈 (明显警示长震 250ms)
+            android.os.Vibrator v = (android.os.Vibrator) getSystemService(VIBRATOR_SERVICE);
+            if (v != null && v.hasVibrator()) {
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                    v.vibrate(android.os.VibrationEffect.createOneShot(250, android.os.VibrationEffect.DEFAULT_AMPLITUDE));
+                } else {
+                    v.vibrate(250);
+                }
+            }
+            // 2. 播放系统提示音
+            android.net.Uri sound = android.media.RingtoneManager.getDefaultUri(android.media.RingtoneManager.TYPE_NOTIFICATION);
+            if (sound != null) {
+                android.media.Ringtone r = android.media.RingtoneManager.getRingtone(getApplicationContext(), sound);
+                if (r != null) r.play();
+            }
+            // 3. 更新前台通知
+            updateNotification("PhoneMic 待机中", "电脑已断开连接，等待重新连接");
+        } catch (Exception ignored) {}
+    }
+
+    private void updateNotification(String title, String content) {
+        try {
+            NotificationManager nm = getSystemService(NotificationManager.class);
+            if (nm != null) {
+                Notification n = new Notification.Builder(this, "mic")
+                        .setContentTitle(title)
+                        .setContentText(content)
+                        .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                        .setOngoing(true)
+                        .build();
+                nm.notify(1, n);
+            }
+        } catch (Exception ignored) {}
+    }
+
     private Notification buildNotification() {
         NotificationManager nm = getSystemService(NotificationManager.class);
         NotificationChannel ch = new NotificationChannel("mic", "麦克风服务",
                 NotificationManager.IMPORTANCE_LOW);
         nm.createNotificationChannel(ch);
         return new Notification.Builder(this, "mic")
-                .setContentTitle("PhoneMic 运行中")
-                .setContentText("麦克风共享中，地址见 App 屏幕")
+                .setContentTitle("PhoneMic 待机中")
+                .setContentText("等待电脑连接，地址见 App 屏幕")
                 .setSmallIcon(android.R.drawable.ic_btn_speak_now)
                 .build();
     }
