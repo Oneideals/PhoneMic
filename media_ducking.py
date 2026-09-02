@@ -13,7 +13,8 @@ import ctypes.util
 import subprocess
 import threading
 import time
-from typing import List, Optional
+from pathlib import Path
+from typing import Callable, List, Optional
 
 # ---------- CoreAudio 系统输出静音控制 ----------
 
@@ -68,7 +69,12 @@ def get_default_output_device_id() -> Optional[int]:
 
 
 def poke_system_volume() -> bool:
-    """唤醒并刷新系统默认输出设备的音量管线（触发 VolumeScalar 硬件事件，唤醒 Boom 3D / 外接 USB DAC）。"""
+    """唤醒并刷新系统默认输出设备的音量管线。
+
+    关键点：虚拟声卡（Boom 3D 等）与 USB DAC 通常只对"真实的音量变化"作出反应，
+    写回同一个值会被硬件/驱动直接忽略（等于没唤醒）。因此这里先小幅改变音量
+    （±0.02）再立即还原，等效于用户手动"调一下音量"，随后立即恢复原值。
+    """
     success = False
     dev_id = get_default_output_device_id()
     if dev_id and _core_audio:
@@ -90,16 +96,21 @@ def poke_system_volume() -> bool:
                     ctypes.byref(vol),
                 )
                 if status == 0 and size.value == ctypes.sizeof(vol):
-                    set_status = _core_audio.AudioObjectSetPropertyData(
-                        dev_id,
-                        ctypes.byref(addr),
-                        0,
-                        None,
-                        size,
-                        ctypes.byref(vol),
-                    )
-                    if set_status == 0:
-                        success = True
+                    # 计算一个与原值不同的"轻推"值（音量接近上限时向下轻推）
+                    nudged = vol.value + 0.02 if vol.value < 0.98 else vol.value - 0.02
+                    nudged = min(max(nudged, 0.0), 1.0)
+                    for target in (nudged, vol.value):
+                        t = ctypes.c_float(target)
+                        set_status = _core_audio.AudioObjectSetPropertyData(
+                            dev_id,
+                            ctypes.byref(addr),
+                            0,
+                            None,
+                            size,
+                            ctypes.byref(t),
+                        )
+                        if set_status == 0:
+                            success = True
             except Exception:
                 pass
     if not success:
@@ -286,20 +297,88 @@ def resume_applescript_players(players: List[str]) -> None:
 
 # ---------- AudioDucker 控制器 ----------
 
-class AudioDucker:
-    """智能音频避让控制器：负责在语音识别时静音与暂停播放，识别结束时恢复。"""
+def _ducker_log(msg: str) -> None:
+    """避让控制器日志（落盘 .debug.log，缺失时静默）。"""
+    try:
+        import debuglog
+        debuglog.log("ducker", msg)
+    except Exception:
+        pass
 
-    def __init__(self, enabled_getter=lambda: True):
+
+class AudioDucker:
+    """智能音频避让控制器：负责在语音识别时静音与暂停播放，识别结束时恢复。
+
+    崩溃安全设计：当传入 state_file 时，「由本控制器执行的系统静音」会先落盘
+    标记再执行；进程若在静音期间被 SIGKILL/崩溃（atexit 不会运行），下一次
+    启动会通过该标记检测到遗留静音并自动解除（或重建避让状态），杜绝
+    "用过 PhoneMic 后系统无声、要手动调音量才恢复"的泄漏。
+    """
+
+    def __init__(self,
+                 enabled_getter: Callable[[], bool] = lambda: True,
+                 state_file: Optional[str] = None,
+                 still_recording_getter: Callable[[], bool] = lambda: False):
         self.enabled_getter = enabled_getter
         self._lock = threading.Lock()
         self._is_ducked = False
         self._did_mute_system = False
         self._was_playing_media = False
         self._paused_apps: List[str] = []
+        self._state_file = Path(state_file) if state_file else None
+        self._still_recording_getter = still_recording_getter
+        self._recover_orphaned_mute()
 
     @property
     def is_ducked(self) -> bool:
         return self._is_ducked
+
+    # ---------- 持久化标记 ----------
+
+    def _mark_mute_by_us(self) -> None:
+        if self._state_file is None:
+            return
+        try:
+            self._state_file.write_text("1")
+        except Exception:
+            pass
+
+    def _clear_mute_mark(self) -> None:
+        if self._state_file is None:
+            return
+        try:
+            self._state_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def _has_mute_mark(self) -> bool:
+        if self._state_file is None:
+            return False
+        try:
+            return self._state_file.exists()
+        except Exception:
+            return False
+
+    def _recover_orphaned_mute(self) -> None:
+        """启动时检测上次进程异常退出遗留的系统静音（duck 泄漏）。"""
+        if not self._has_mute_mark():
+            return
+        try:
+            if self._still_recording_getter():
+                # 用户仍处于录音状态（例如按着 PTT 键期间进程被杀重启）：
+                # 重建避让状态，保证松开按键时能正常解除静音
+                self._is_ducked = True
+                self._did_mute_system = True
+                set_system_mute(True)
+                _ducker_log("检测到上次异常退出遗留的静音且录音仍在进行——已重建避让状态")
+            else:
+                set_system_mute(False)
+                self._clear_mute_mark()
+                _ducker_log("检测到上次异常退出遗留的系统静音，已自动解除")
+        except Exception:
+            _ducker_log("遗留静音恢复失败（下次 unduck/启动时重试）")
+
+    # ---------- duck / unduck ----------
 
     def duck(self) -> None:
         """进入录音状态：暂停背景播放并系统静音。"""
@@ -332,6 +411,8 @@ class AudioDucker:
             # 3. 检查并设置系统输出静音（微秒级消除所有应用外放音，防麦克风串音）
             was_muted = get_system_mute()
             if not was_muted:
+                # 先落盘标记再静音：即使进程在两步之间被杀，下次启动也能恢复
+                self._mark_mute_by_us()
                 set_system_mute(True)
                 self._did_mute_system = True
             else:
@@ -340,13 +421,21 @@ class AudioDucker:
     def unduck(self) -> None:
         """退出录音状态：恢复系统静音与媒体播放。"""
         with self._lock:
+            # 兜底：本实例未 duck，但磁盘上存在遗留静音标记（进程重启后的首次
+            # 释放）→ 仍然解除静音，避免泄漏的静音永久粘在系统上
+            orphan_release = False
             if not self._is_ducked:
-                return
+                if self._has_mute_mark():
+                    orphan_release = True
+                else:
+                    return
             self._is_ducked = False
 
             # 1. 恢复系统静音状态
-            if self._did_mute_system:
-                set_system_mute(False)
+            if self._did_mute_system or orphan_release:
+                if set_system_mute(False):
+                    self._clear_mute_mark()
+                # 解除失败时保留标记，下次 unduck/启动时重试
                 self._did_mute_system = False
 
             # 2. 仅在录音前确实有媒体播放时，恢复播放

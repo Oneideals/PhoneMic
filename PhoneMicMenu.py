@@ -35,6 +35,7 @@ SWITCH_TOOL = "/opt/homebrew/bin/SwitchAudioSource"
 GAIN_CHOICES = [0, 3, 6, 9, 12, 15, 18]     # 上限与 phonemic.MAX_GAIN_DB / 手机端保持一致
 RIGHT_OPTION_KEYCODE = 61                   # 右 Option 键码（调试用）
 NX_DEVICERALTKEYMASK = 0x0040               # 右 Option 的设备修饰位（IOLLEvent.h: NX_DEVICERALTKEYMASK）
+SINGLE_CLICK_WINDOW = 0.22                  # 右⌥ 按下后等待其他键的时间窗（秒），超过即判定单击
 LOCK_FILE = BASE / ".phonemic_lock"         # 引擎单实例锁（内容为引擎 PID）
 LAST_URL_FILE = BASE / ".phonemic_last_url" # 最新连通 URL 文件
 
@@ -155,13 +156,60 @@ def _show_notification(title: str, message: str, sound: str = None):
         pass
 
 
+class PTTFsm:
+    """PTT 按键纯逻辑状态机（不依赖 Quartz，可单测）。
+
+    对齐微信输入法（WeType）的交互语义：
+    - 右⌥ 单击 → 开始录音（按下后 SINGLE_CLICK_WINDOW 内无其他键跟进才算单击，
+      避免把 ⌥+方向键 等组合键误判为开始录音）；
+    - 录音中按右⌥ 或任意其他键（含 ESC）→ 结束录音；
+    - 窗口内快速再按一次右⌥ → 视作"开始又结束"，净效果为零（不触发任何动作）。
+
+    状态：idle（空闲）/ pending（右⌥ 已按下，等待判定单击或组合键）/ recording。
+    动作返回值："arm"=启动单击判定窗（调用方需安排超时回调）、
+    "start"=判定单击，开始录音、"end"=结束录音、None=无动作。
+    """
+
+    def __init__(self, window: float = SINGLE_CLICK_WINDOW):
+        self.window = window
+        self.state = "idle"
+
+    def on_right_option_press(self):
+        if self.state == "pending":
+            # 窗口内二次按下右⌥：视作"开始又立刻结束"，静默抵消
+            self.state = "idle"
+            return None
+        if self.state == "recording":
+            self.state = "idle"
+            return "end"
+        self.state = "pending"
+        return "arm"
+
+    def on_other_key(self):
+        """任意普通按键 keyDown，或其他修饰键的按下沿。"""
+        if self.state == "pending":
+            self.state = "idle"          # 组合键（⌥+其他键）→ 取消单击判定
+            return None
+        if self.state == "recording":
+            self.state = "idle"
+            return "end"                 # 录音中任意键 → 结束（对齐 WeType）
+        return None
+
+    def on_window_timeout(self):
+        """单击判定窗超时：期间无其他键跟进，确认单击。"""
+        if self.state == "pending":
+            self.state = "recording"
+            return "start"
+        return None
+
+
 def start_ptt_listener(on_state, on_error, on_mode=None):
-    """监听右 Option：单击切换录音（微信语音输入式），非按住。
+    """监听录音按键（对齐微信输入法交互）：右⌥ 单击开始；录音中按任意键结束。
 
     优先用 HID 层 listen-only 事件 tap：在微信输入法（WeType）等拦截软件
     修改/吞掉按键之前就能看到原始硬件事件，且不受睡眠唤醒影响。
     无「输入监控」权限时降级为轮询 CGEventSourceFlagsState（公开 API 免权限，
-    但被输入法拦截的按键会看不到）。
+    但被输入法拦截的按键会看不到，且无法感知"任意键结束"）。
     on_state(active) 在录音开关状态变化时回调；on_error(msg) 在两种方案都不可用时回调；
     on_mode(mode) 回调当前方案（"tap"=事件监听 / "poll"=轮询降级）。
     """
@@ -171,6 +219,54 @@ def start_ptt_listener(on_state, on_error, on_mode=None):
         except ImportError:
             on_error("缺少 pyobjc（Quartz），PTT 不可用")
             return
+
+        # 其他修饰键 keycode → 功能位映射（用于识别"修饰键按下沿"；
+        # 左右两枚同功能键共用同一个 flag，按下沿=事件后 flag 位为 1）
+        mod_flags = {
+            54: Quartz.kCGEventFlagMaskCommand,      # 右⌘
+            55: Quartz.kCGEventFlagMaskCommand,      # 左⌘
+            56: Quartz.kCGEventFlagMaskShift,        # 左⇧
+            58: Quartz.kCGEventFlagMaskAlternate,    # 左⌥
+            59: Quartz.kCGEventFlagMaskControl,      # 左⌃
+            60: Quartz.kCGEventFlagMaskShift,        # 右⇧
+            62: Quartz.kCGEventFlagMaskControl,      # 右⌃
+            63: Quartz.kCGEventFlagMaskSecondaryFn,  # Fn
+            57: Quartz.kCGEventFlagMaskAlphaShift,   # Caps Lock
+        }
+
+        fsm = PTTFsm()
+        if _read_ptt():
+            # 进程重启时录音开关可能仍处于「开」（菜单有沿用逻辑）：
+            # FSM 必须同步到 recording，否则"任意键结束"会失效
+            fsm.state = "recording"
+            debuglog.log("menu", "PTT 状态机启动：检测到录音开关处于「开」，FSM 同步为 recording")
+        pending_timer = {"t": None}
+
+        def _cancel_pending_timer():
+            t = pending_timer["t"]
+            if t is not None:
+                t.cancel()
+                pending_timer["t"] = None
+
+        def _act(action, why):
+            if action == "arm":
+                _cancel_pending_timer()
+                t = threading.Timer(fsm.window, _on_timeout)
+                t.daemon = True
+                pending_timer["t"] = t
+                t.start()
+            elif action == "start":
+                debuglog.log("menu", f"右⌥ 单击判定成立（{why}）→ 开始录音")
+                on_state(True)
+            elif action == "end":
+                debuglog.log("menu", f"结束录音（{why}）")
+                on_state(False)
+
+        def _on_timeout():
+            pending_timer["t"] = None
+            action = fsm.on_window_timeout()
+            if action:
+                _act(action, f"{fsm.window}s 内无其他键跟进")
 
         def tap_callback(_proxy, _etype, event, _refcon):
             try:
@@ -187,10 +283,24 @@ def start_ptt_listener(on_state, on_error, on_mode=None):
                     return event
                 keycode = Quartz.CGEventGetIntegerValueField(
                     event, Quartz.kCGKeyboardEventKeycode)
-                # 只认按下沿（Alternate 位被置位 = 按下）；松开事件忽略
-                if keycode == RIGHT_OPTION_KEYCODE and \
-                        Quartz.CGEventGetFlags(event) & Quartz.kCGEventFlagMaskAlternate:
-                    on_state(not _read_ptt())
+                flags = Quartz.CGEventGetFlags(event)
+                if etype == Quartz.kCGEventFlagsChanged:
+                    if keycode == RIGHT_OPTION_KEYCODE:
+                        # 只认按下沿（Alternate 位被置位 = 按下）；松开事件忽略
+                        if flags & Quartz.kCGEventFlagMaskAlternate:
+                            action = fsm.on_right_option_press()
+                            if action:
+                                _act(action, "按下右⌥")
+                        # 松开：不产生动作（维持 FSM 现状）
+                    elif keycode in mod_flags and flags & mod_flags[keycode]:
+                        # 其他修饰键按下沿：等价"任意键"
+                        action = fsm.on_other_key()
+                        if action:
+                            _act(action, f"修饰键 keycode={keycode}")
+                elif etype == Quartz.kCGEventKeyDown:
+                    action = fsm.on_other_key()
+                    if action:
+                        _act(action, f"按键 keycode={keycode}")
             except Exception:
                 pass
             return event
@@ -201,7 +311,8 @@ def start_ptt_listener(on_state, on_error, on_mode=None):
                 Quartz.kCGHIDEventTap,
                 Quartz.kCGHeadInsertEventTap,
                 Quartz.kCGEventTapOptionListenOnly,
-                Quartz.CGEventMaskBit(Quartz.kCGEventFlagsChanged),
+                Quartz.CGEventMaskBit(Quartz.kCGEventFlagsChanged)
+                | Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown),
                 tap_callback, None)
         except Exception:
             tap = None
@@ -213,7 +324,7 @@ def start_ptt_listener(on_state, on_error, on_mode=None):
                 Quartz.CGEventTapEnable(tap, True)
                 if on_mode:
                     on_mode("tap")
-                debuglog.log("menu", "PTT 监听：事件 tap 模式已启用")
+                debuglog.log("menu", "PTT 监听：事件 tap 模式已启用（右⌥单击开始/任意键结束）")
                 Quartz.CFRunLoopRun()
                 debuglog.log("menu", "⚠️ PTT 事件 tap 的 CFRunLoop 意外返回（事件监听中断）")
                 return
@@ -222,9 +333,10 @@ def start_ptt_listener(on_state, on_error, on_mode=None):
                 on_error("PTT 事件监听异常退出")
                 return
 
-        # 降级方案：轮询（20ms）。被输入法拦截的键看不到，但免系统权限
+        # 降级方案：轮询（20ms）。被输入法拦截的键看不到，且只能感知右⌥
+        # （无法实现"任意键结束"），保持单击切换语义
         debuglog.log("menu", "PTT 监听：未取得输入监控权限，降级为轮询模式"
-                             "（微信输入法等可能拦截按键导致失效）")
+                             "（仅右⌥ 切换；任意键结束不可用）")
         if on_mode:
             on_mode("poll")
         pressed = False
@@ -294,7 +406,9 @@ class PhoneMicMenu(rumps.App):
         self.speaking_until = 0.0
         self.level_hist = []
         self.ducker = media_ducking.AudioDucker(
-            enabled_getter=lambda: self._flag_on(DUCK_FILE, default=1) == 1
+            enabled_getter=lambda: self._flag_on(DUCK_FILE, default=1) == 1,
+            state_file=BASE / ".duck_state",
+            still_recording_getter=_read_ptt,
         )
         self.item_status = rumps.MenuItem(TEXTS["stopped"], callback=None)
         self.item_mode = rumps.MenuItem("传输链路：🔍 检测中…", callback=None)
@@ -302,7 +416,7 @@ class PhoneMicMenu(rumps.App):
         self.item_toggle = rumps.MenuItem("启动", callback=self.on_toggle)
         self.item_denoise = rumps.MenuItem("降噪：过滤电脑风扇声", callback=self.on_denoise)
         self.item_denoise.state = self._flag_on(DENOISE_FILE)
-        self.item_rec = rumps.MenuItem("录音存档（单击右⌥开始/再单击结束）", callback=self.on_record)
+        self.item_rec = rumps.MenuItem("录音存档（右⌥单击开始 / 录音中按任意键结束）", callback=self.on_record)
         self.item_rec.state = self._flag_on(RECORD_FILE)
         self.item_duck = rumps.MenuItem("录音时自动暂停背景音（防串音）", callback=self.on_duck)
         self.item_duck.state = self._flag_on(DUCK_FILE, default=1)
@@ -479,8 +593,10 @@ class PhoneMicMenu(rumps.App):
             _play_sound("Pop")
             self.ducker.duck()
         else:
-            _play_sound("Tink")
             self.ducker.unduck()
+            # 先解除静音再播提示音：既让用户听到"结束录音"反馈，
+            # 也顺带确认输出管线已恢复（无声即说明异常）
+            _play_sound("Tink")
         self.refresh()
 
     # ---------- 菜单动作 ----------
@@ -488,8 +604,7 @@ class PhoneMicMenu(rumps.App):
     def on_toggle(self, sender):
         if self.should_run:
             self.should_run = False
-            if self.ducker.is_ducked:
-                self.ducker.unduck()
+            self.ducker.unduck()   # 未 duck 时内部自动判断是否需解除遗留静音
             self._stop_engines()
             self.status = "stopped"
         else:

@@ -413,12 +413,133 @@ def test_media_ducking():
     check("音频避让: MediaRemote.framework isPlaying 安全调用", isinstance(mr_playing, bool))
 
 
+def test_media_ducking_crash_safety():
+    """崩溃安全测试：模拟菜单进程在 duck 状态被 SIGKILL 后，新实例自动恢复遗留静音。
+
+    对应缺陷：PhoneMicMenu 被强杀/崩溃时系统静音泄漏；新实例 unduck() 因
+    _is_ducked=False 直接返回（no-op），下一次 duck() 又把泄漏静音误判为
+    "用户自己静的"（_did_mute_system=False）→ 静音永久粘住，需手动调音量才恢复。
+    """
+    import media_ducking
+
+    state = BASE / ".duck_state_test"
+    try:
+        state.unlink()
+    except FileNotFoundError:
+        pass
+
+    orig_mute = media_ducking.get_system_mute()
+    media_ducking.set_system_mute(False)
+    try:
+        # 场景1：duck 中进程被杀（不调用 unduck/清理），且用户已停止录音
+        d1 = media_ducking.AudioDucker(enabled_getter=lambda: True,
+                                       state_file=state,
+                                       still_recording_getter=lambda: False)
+        d1.duck()
+        check("崩溃安全: duck 后静音标记已落盘", state.exists())
+        check("崩溃安全: duck 后系统静音", media_ducking.get_system_mute() is True)
+        # 模拟 SIGKILL：直接丢弃 d1（不 cleanup），启动新实例
+        d2 = media_ducking.AudioDucker(enabled_getter=lambda: True,
+                                       state_file=state,
+                                       still_recording_getter=lambda: False)
+        check("崩溃安全: 重启实例自动解除遗留静音",
+              media_ducking.get_system_mute() is False)
+        check("崩溃安全: 恢复后静音标记已清除", not state.exists())
+
+        # 场景2：被杀时录音仍在进行（.ptt=1）→ 重建避让状态，松开时正常解除
+        d3 = media_ducking.AudioDucker(enabled_getter=lambda: True,
+                                       state_file=state,
+                                       still_recording_getter=lambda: False)
+        d3.duck()
+        d4 = media_ducking.AudioDucker(enabled_getter=lambda: True,
+                                       state_file=state,
+                                       still_recording_getter=lambda: True)
+        check("崩溃安全: 录音进行中重启 → 保持静音并重建避让",
+              media_ducking.get_system_mute() is True and d4.is_ducked)
+        d4.unduck()
+        check("崩溃安全: 重建后 unduck 正常解除静音",
+              media_ducking.get_system_mute() is False and not state.exists())
+
+        # 场景3：实例从未 duck 但磁盘存在遗留标记（如恢复失败后的重试路径）
+        d5 = media_ducking.AudioDucker(enabled_getter=lambda: True,
+                                       state_file=state,
+                                       still_recording_getter=lambda: False)
+        media_ducking.set_system_mute(True)
+        state.write_text("1")
+        d5._is_ducked = False
+        d5._did_mute_system = False
+        d5.unduck()
+        check("崩溃安全: 未 duck 但存在遗留标记时 unduck 兜底解除",
+              media_ducking.get_system_mute() is False and not state.exists())
+
+        # 场景4：用户原本就静音 → duck 不落盘标记，unduck 不破坏用户静音意图
+        media_ducking.set_system_mute(True)
+        d6 = media_ducking.AudioDucker(enabled_getter=lambda: True,
+                                       state_file=state,
+                                       still_recording_getter=lambda: False)
+        d6.duck()
+        check("崩溃安全: 用户已静音时 duck 不写标记", not state.exists())
+        d6.unduck()
+        check("崩溃安全: unduck 不解除用户自己的静音",
+              media_ducking.get_system_mute() is True)
+    finally:
+        media_ducking.set_system_mute(orig_mute)
+        try:
+            state.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def test_ptt_fsm():
+    """PTT 状态机测试：右⌥单击开始 / 组合键不误触发 / 录音中任意键结束（对齐微信输入法）。"""
+    import PhoneMicMenu as pmm
+
+    # 场景1：右⌥ 单击（按下后无其他键，超时确认）→ 开始
+    f = pmm.PTTFsm()
+    check("PTT: 右⌥按下 → arm", f.on_right_option_press() == "arm")
+    check("PTT: 窗口超时 → start（单击判定成立）", f.on_window_timeout() == "start")
+
+    # 场景2：录音中按右⌥ → 结束
+    check("PTT: 录音中按右⌥ → end", f.on_right_option_press() == "end")
+
+    # 场景3：录音中按任意普通键（含 ESC keycode=53）→ 结束
+    f2 = pmm.PTTFsm()
+    f2.on_right_option_press()
+    f2.on_window_timeout()
+    check("PTT: 录音中按 ESC/任意键 → end", f2.on_other_key() == "end")
+
+    # 场景4：⌥+其他键 组合（右⌥ 按下后 0.22s 内有键跟进）→ 不触发录音
+    f3 = pmm.PTTFsm()
+    check("PTT: 组合键场景右⌥按下 → arm", f3.on_right_option_press() == "arm")
+    check("PTT: 组合键其他键跟进 → 取消（无动作）", f3.on_other_key() is None)
+    check("PTT: 取消后窗口超时 → 无动作", f3.on_window_timeout() is None)
+
+    # 场景5：窗口内快速双击右⌥ → 静默抵消（无任何动作）
+    f4 = pmm.PTTFsm()
+    f4.on_right_option_press()
+    check("PTT: 窗口内二次右⌥ → 静默抵消", f4.on_right_option_press() is None)
+    check("PTT: 抵消后超时 → 无动作", f4.on_window_timeout() is None)
+
+    # 场景6：组合键后再次单击右⌥ → 正常开始（状态干净）
+    check("PTT: 组合键后再按右⌥ → arm", f4.on_right_option_press() == "arm")
+    check("PTT: 超时 → start", f4.on_window_timeout() == "start")
+
+    # 场景7：录音中按其他修饰键（⇧/⌘/Fn 等）→ 结束
+    check("PTT: 录音中按修饰键 → end", f4.on_other_key() == "end")
+
+    # 场景8：空闲时按任意键 → 无动作（不会误开始）
+    f5 = pmm.PTTFsm()
+    check("PTT: 空闲时按任意键 → 无动作", f5.on_other_key() is None)
+
+
 if __name__ == "__main__":
     test_wav_header()
     test_lock()
     test_stream_and_sigterm()
     test_udp_reconnect()
     test_media_ducking()
+    test_media_ducking_crash_safety()
+    test_ptt_fsm()
     print(f"\n结果: {len(PASS)} 通过 / {len(FAIL)} 失败")
     if FAIL:
         print("失败项:", FAIL)
