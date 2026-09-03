@@ -926,10 +926,8 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
             recorder, meta_fh = None, None
     else:
         debuglog.log("engine", "录音存档未开启（record != 1）：PTT 期间不落盘")
-    resp = StreamTee(resp, recorder, payload)
-    payload = b""
 
-    # 降噪（可选）：ffmpeg afftdn 过滤电脑风扇等稳态噪声
+    # 降噪（可选）：ffmpeg 黄金人声降噪链（二阶高通切除桌面共振 + 自适应对齐底噪平滑降噪 + 高频平滑）
     ff = None
     denoise = False
     try:
@@ -939,12 +937,16 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
         pass
     if denoise and ch == 1 and bits == 16:
         try:
+            # highpass=f=85:poles=2: 二阶 Butterworth 高通彻底切除 <85Hz 桌面震动与握持风噪；
+            # afftdn=nr=12:nf=-48:tn=1:gs=4: 噪声底 -48dBFS 对齐实测底噪，tn=1 跟踪风扇变化，gs=4 平滑频域彻底消除金属电音；
+            # lowpass=f=12000:poles=1: 滤除 >12kHz 开关电源与高频杂散底噪，听感更沉静温暖
+            flt_chain = "highpass=f=85:poles=2,afftdn=nr=12:nf=-48:tn=1:gs=4,lowpass=f=12000:poles=1"
             ff = subprocess.Popen(
                 ["ffmpeg", "-hide_banner", "-loglevel", "error",
                  "-fflags", "nobuffer", "-flags", "low_delay",
                  "-probesize", "32", "-analyzeduration", "0",
                  "-f", "s16le", "-ar", str(rate), "-ac", "1", "-i", "pipe:0",
-                 "-af", "highpass=f=80,afftdn=nr=8:nf=-60:tn=0",
+                 "-af", flt_chain,
                  "-f", "s16le", "-ar", str(rate), "-ac", "1", "pipe:1"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
 
@@ -964,13 +966,19 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
                         pass
 
             threading.Thread(target=feeder, daemon=True).start()
-            source, payload = ff.stdout, b""
-            print("[降噪] 已启用：过滤风扇等稳态噪声（afftdn）", flush=True)
-        except Exception:
+            source = ff.stdout
+            print("[降噪] 已启用：黄金人声降噪链（二阶高通85Hz+自适应底噪对齐+平滑增益gs=4+高频修整）", flush=True)
+            debuglog.log("engine", f"降噪管道已启动: {flt_chain}")
+        except Exception as e:
             ff = None
             source = resp
+            debuglog.log("engine", f"降噪启动异常: {e}")
     else:
         source = resp
+
+    # 录音器挂在最终流（开启降噪时录下纯净降噪人声，所听即所录）
+    source = StreamTee(source, recorder, payload)
+    payload = b""
 
     frame_bytes = ch * bits // 8
     byte_rate = rate * frame_bytes

@@ -417,6 +417,7 @@ class PhoneMicMenu(rumps.App):
         _ensure_edit_menu()
         super().__init__(name="PhoneMic", quit_button="退出 PhoneMic")
         self.paths = build_icons()
+        self._current_icon = self.paths["stopped"]
         self.icon = self.paths["stopped"]
         self.proc = None
         self.should_run = False
@@ -835,23 +836,38 @@ class PhoneMicMenu(rumps.App):
 
     # ---------- 状态刷新 ----------
 
+    def _set_icon(self, path: str):
+        """只在图标路径真正变化时才赋值，彻底杜绝每秒 4 次向 Cocoa 重复创建/释放 NSImage 引发的 CFRelease 崩溃。"""
+        if getattr(self, "_current_icon", None) != path:
+            self._current_icon = path
+            try:
+                self.icon = path
+            except Exception as e:
+                debuglog.log("menu", f"设置图标异常: {e}")
+
+    @staticmethod
+    def _set_title(item, title: str):
+        """只在标题真正变化时才更新 MenuItem.title，减轻主线程 RunLoop 与 PyObjC 垃圾回收压力。"""
+        if item.title != title:
+            item.title = title
+
     def recording_on(self) -> bool:
         return self.status == "streaming" and self._flag_on(RECORD_FILE) == 1
 
     def refresh(self):
         # 配对状态
-        self.item_pair.title = ("配对：✅ 已配对（点此修改）" if phonemic.load_token()
-                                else "配对：⚠️ 未配对（插 USB 线自动配对，或点此手填）")
+        self._set_title(self.item_pair, "配对：✅ 已配对（点此修改）" if phonemic.load_token()
+                                         else "配对：⚠️ 未配对（插 USB 线自动配对，或点此手填）")
 
         # PTT 监听状态显示
         if self.ptt_error:
-            self.item_ptt.title = f"⚠️ PTT：{self.ptt_error}"
+            self._set_title(self.item_ptt, f"⚠️ PTT：{self.ptt_error}")
         elif self.ptt_active:
-            self.item_ptt.title = "🎤 录音中（再按右⌥结束）"
+            self._set_title(self.item_ptt, "🎤 录音中（再按右⌥结束）")
         elif self.ptt_mode == "poll":
-            self.item_ptt.title = "PTT：轮询模式（建议授权「输入监控」以穿透输入法拦截）"
+            self._set_title(self.item_ptt, "PTT：轮询模式（建议授权「输入监控」以穿透输入法拦截）")
         else:
-            self.item_ptt.title = "PTT：按右⌥开始录音，再按结束"
+            self._set_title(self.item_ptt, "PTT：按右⌥开始录音，再按结束")
 
         # 引擎连通性以 .level 新鲜度为准（引擎每 0.5s 写一次）：
         # 孤儿引擎在写也算连通；标记 streaming 但 .level 停更则立即回落
@@ -885,10 +901,10 @@ class PhoneMicMenu(rumps.App):
             self._restore_sys_input()
 
         if not self.should_run:
-            self.icon = self.paths["stopped"]
-            self.item_status.title = "○ PhoneMic 已停止"
-            self.item_mode.title = "传输链路：⏸ 已停止"
-            self.item_level.title = "电平诊断：--"
+            self._set_icon(self.paths["stopped"])
+            self._set_title(self.item_status, "○ PhoneMic 已停止")
+            self._set_title(self.item_mode, "传输链路：⏸ 已停止")
+            self._set_title(self.item_level, "电平诊断：--")
         elif self.status == "streaming":
             try:
                 lv = int(LEVEL_FILE.read_text().strip() or 0)
@@ -896,7 +912,7 @@ class PhoneMicMenu(rumps.App):
                 lv = 0
 
             is_recording = self.ptt_active
-            self.icon = self.paths["recording" if is_recording else "on"]
+            self._set_icon(self.paths["recording" if is_recording else "on"])
             status_tag = "（🎤 录音中）" if is_recording else ""
 
             last_url = ""
@@ -906,8 +922,8 @@ class PhoneMicMenu(rumps.App):
             except Exception:
                 pass
             mode_tag = phonemic.link_mode_label(last_url) or "🔍 探测中…"
-            self.item_status.title = "● 手机麦克风已连通" + status_tag
-            self.item_mode.title = f"传输链路：{mode_tag}"
+            self._set_title(self.item_status, "● 手机麦克风已连通" + status_tag)
+            self._set_title(self.item_mode, f"传输链路：{mode_tag}")
 
             self.level_hist.append(lv)
             if len(self.level_hist) > 15:
@@ -929,13 +945,13 @@ class PhoneMicMenu(rumps.App):
                 verdict = f"峰值 {wmax}% 过大（建议降增益）"
             else:
                 verdict = f"峰值 {wmax}% 过大（离嘴远一点）"
-            self.item_level.title = f"电平诊断：实时 {lv}% · 峰值 {wmax}% ({verdict})"
+            self._set_title(self.item_level, f"电平诊断：实时 {lv}% · 峰值 {wmax}% ({verdict})")
         else:
-            self.icon = self.paths["connecting"]
-            self.item_status.title = "◐ 正在寻找手机…"
-            self.item_mode.title = "传输链路：🔍 正在探测 USB / UDP / Wi-Fi…"
-            self.item_level.title = "电平诊断：--"
-        self.item_toggle.title = "停止" if self.should_run else "启动"
+            self._set_icon(self.paths["connecting"])
+            self._set_title(self.item_status, "◐ 正在寻找手机…")
+            self._set_title(self.item_mode, "传输链路：🔍 正在探测 USB / UDP / Wi-Fi…")
+            self._set_title(self.item_level, "电平诊断：--")
+        self._set_title(self.item_toggle, "停止" if self.should_run else "启动")
 
         # 每分钟一次状态快照：便于把"某时刻的现象"和日志时间线对齐
         now = time.time()
@@ -984,7 +1000,10 @@ if __name__ == "__main__":
     atexit.register(app.ducker.cleanup)
 
     def ticker(_):
-        app.refresh()
+        try:
+            app.refresh()
+        except Exception as e:
+            debuglog.log("menu", f"定时器刷新异常: {e}", exc=True)
 
     timer = rumps.Timer(ticker, 0.25)
     timer.start()
