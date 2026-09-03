@@ -12,6 +12,8 @@
     <application
         android:name=".PhonemicApplication"
         android:label="PhoneMic"
+        android:allowBackup="false"
+        android:fullBackupContent="false"
         android:theme="@style/Theme.Material3.DayNight.NoActionBar">
 
         <activity android:name=".MainActivity" android:exported="true"

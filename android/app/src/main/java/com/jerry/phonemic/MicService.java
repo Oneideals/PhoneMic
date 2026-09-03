@@ -3,6 +3,7 @@ package com.jerry.phonemic;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Intent;
 import android.media.AudioFormat;
@@ -671,6 +672,14 @@ public class MicService extends Service {
         } catch (Exception ignored) {}
     }
 
+    private PendingIntent getNotificationPendingIntent() {
+        Intent intent = new Intent(this, MainActivity.class);
+        intent.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        return PendingIntent.getActivity(
+                this, 0, intent,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+    }
+
     private void updateNotification(String title, String content) {
         try {
             NotificationManager nm = getSystemService(NotificationManager.class);
@@ -679,6 +688,7 @@ public class MicService extends Service {
                         .setContentTitle(title)
                         .setContentText(content)
                         .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                        .setContentIntent(getNotificationPendingIntent())
                         .setOngoing(true)
                         .build();
                 nm.notify(1, n);
@@ -695,6 +705,7 @@ public class MicService extends Service {
                 .setContentTitle("PhoneMic 待机中")
                 .setContentText("等待电脑连接，地址见 App 屏幕")
                 .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                .setContentIntent(getNotificationPendingIntent())
                 .build();
     }
 }
