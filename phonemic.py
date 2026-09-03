@@ -44,6 +44,7 @@ GAIN_FILE = BASE / "gain_db"        # 数字增益（dB），菜单栏应用写�
 LEVEL_FILE = BASE / ".level"        # 引擎实时输出电平（0~100），菜单栏读取显示
 RECORD_FILE = BASE / "record"       # 录音存档开关（"1"=开启）
 PTT_FILE = BASE / ".ptt"            # 录音开关状态（"1"=录音中，单击右⌥切换），菜单栏监听写入
+GATE_FILE = BASE / "gate_mode"      # 语音输入门控模式（"1"=开启：仅录音时向声卡输出音频，防串音；"0"=常开全通）
 REC_DIR = BASE / "recordings"       # 录音与指标文件目录
 PTT_MIN_SEGMENT = 0.3               # 短于此秒数的录音段视为误触，丢弃
 RECONNECT_FILE = BASE / ".reconnect"   # 菜单栏「立即重连」信号（存在即触发）
@@ -1017,6 +1018,8 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
                 debuglog.log("engine", f"producer 异常退出：{type(e).__name__}: {e}", exc=True)
 
     rem = bytearray()
+    ptt_sync = {"on": False, "t": 0.0}
+    gate_sync = {"on": True, "t": 0.0}
 
     def callback(outdata, frames, _t, _status):
         if not hb["cb_started"]:
@@ -1024,8 +1027,35 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
             debuglog.log("engine",
                          f"声卡首次回调就位（距会话开始 "
                          f"{time.time() - hb['t_start']:.1f}s）")
-        hb["cb"] = time.time()
+        now = time.time()
+        hb["cb"] = now
         hb["cb_count"] += 1
+
+        # 1. 快速同步 PTT 状态（20ms 周期）
+        if now - ptt_sync["t"] > 0.02:
+            ptt_sync["t"] = now
+            try:
+                cur_ptt = PTT_FILE.exists() and PTT_FILE.read_text().strip() == "1"
+            except Exception:
+                cur_ptt = False
+            # 方案三：检测到 PTT 翻转为开（录音开始瞬间）→ 立即冲刷清空在途队列与缓存
+            if cur_ptt and not ptt_sync["on"]:
+                while not q.empty():
+                    try:
+                        q.get_nowait()
+                    except queue.Empty:
+                        break
+                rem.clear()
+            ptt_sync["on"] = cur_ptt
+
+        # 2. 定期同步门控开关配置（200ms 周期，默认开启）
+        if now - gate_sync["t"] > 0.2:
+            gate_sync["t"] = now
+            try:
+                gate_sync["on"] = (not GATE_FILE.exists()) or (GATE_FILE.read_text().strip() != "0")
+            except Exception:
+                gate_sync["on"] = True
+
         need = frames * frame_bytes
         while len(rem) < need:
             try:
@@ -1039,10 +1069,19 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
         if dtype == "int16":
             out, limited, peak = process_pcm16(bytes(data), GAIN_DB["v"])
             stat["limited"] = stat.get("limited", 0) + limited
-            outdata[:] = out.reshape(frames, ch)
+            # 方案一：语音输入门控模式
+            # 若门控开启且当前未处于录音状态，向 BlackHole 输出全 0（绝对静音），
+            # 彻底清空外部输入法（微信输入法等）的 Lookback 回溯缓冲
+            if gate_sync["on"] and not ptt_sync["on"]:
+                outdata.fill(0)
+            else:
+                outdata[:] = out.reshape(frames, ch)
         else:
             peak = 0
-            outdata[:] = np.frombuffer(data, dtype=dtype).reshape(frames, ch)
+            if gate_sync["on"] and not ptt_sync["on"]:
+                outdata.fill(0)
+            else:
+                outdata[:] = np.frombuffer(data, dtype=dtype).reshape(frames, ch)
         stat["peak"] = max(peak, stat.get("peak", 0) * 85 // 100)
 
     t = threading.Thread(target=producer, daemon=True)

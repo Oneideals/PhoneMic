@@ -322,6 +322,7 @@ class AudioDucker:
         self.enabled_getter = enabled_getter
         self._lock = threading.Lock()
         self._is_ducked = False
+        self._is_preemptively_ducked = False
         self._did_mute_system = False
         self._was_playing_media = False
         self._paused_apps: List[str] = []
@@ -380,23 +381,64 @@ class AudioDucker:
 
     # ---------- duck / unduck ----------
 
+    def preemptive_duck(self) -> None:
+        """按键按下瞬间抢先物理静音系统输出（微秒级生效，防防抖等待期间外放漏入麦克风）。"""
+        if not self.enabled_getter():
+            return
+        with self._lock:
+            if self._is_ducked or self._is_preemptively_ducked:
+                return
+            self._is_preemptively_ducked = True
+            was_muted = get_system_mute()
+            if not was_muted:
+                self._mark_mute_by_us()
+                set_system_mute(True)
+                self._did_mute_system = True
+            else:
+                self._did_mute_system = False
+
+    def cancel_preemptive_duck(self) -> None:
+        """组合键判定跟进等未成立录音时，取消抢先静音并恢复音量。"""
+        with self._lock:
+            if not self._is_preemptively_ducked or self._is_ducked:
+                return
+            self._is_preemptively_ducked = False
+            if self._did_mute_system:
+                set_system_mute(False)
+                self._clear_mute_mark()
+                self._did_mute_system = False
+
     def duck(self) -> None:
-        """进入录音状态：暂停背景播放并系统静音。"""
+        """进入录音状态：微秒级瞬时物理静音并异步暂停背景播放。"""
         if not self.enabled_getter():
             return
         with self._lock:
             if self._is_ducked:
                 return
             self._is_ducked = True
+            self._is_preemptively_ducked = False
 
-            # 1. 检查媒体播放状态
-            mr_playing = check_media_remote_playing(timeout=0.08)
+            # 1. 第一优先级：微秒级瞬时将系统输出静音（防扬声器声音继续漏入麦克风）
+            if not self._did_mute_system:
+                was_muted = get_system_mute()
+                if not was_muted:
+                    self._mark_mute_by_us()
+                    set_system_mute(True)
+                    self._did_mute_system = True
+                else:
+                    self._did_mute_system = False
+
+        # 2. 第二优先级：在后台异步检测并暂停正在播放的媒体（绝不阻塞主线程/音频管线）
+        def _async_pause():
             as_players = get_applescript_active_players()
-            self._was_playing_media = mr_playing or bool(as_players)
-            self._paused_apps = as_players
-
-            # 2. 如果正在播放，发送暂停指令
-            if self._was_playing_media:
+            mr_playing = check_media_remote_playing(timeout=0.08)
+            was_playing = mr_playing or bool(as_players)
+            with self._lock:
+                if not self._is_ducked:
+                    return
+                self._was_playing_media = was_playing
+                self._paused_apps = as_players
+            if was_playing:
                 if _mr:
                     try:
                         _mr.MRMediaRemoteSendCommand(_kMRPause, None)
@@ -408,19 +450,12 @@ class AudioDucker:
                     except Exception:
                         pass
 
-            # 3. 检查并设置系统输出静音（微秒级消除所有应用外放音，防麦克风串音）
-            was_muted = get_system_mute()
-            if not was_muted:
-                # 先落盘标记再静音：即使进程在两步之间被杀，下次启动也能恢复
-                self._mark_mute_by_us()
-                set_system_mute(True)
-                self._did_mute_system = True
-            else:
-                self._did_mute_system = False
+        threading.Thread(target=_async_pause, daemon=True).start()
 
     def unduck(self) -> None:
         """退出录音状态：恢复系统静音与媒体播放。"""
         with self._lock:
+            self._is_preemptively_ducked = False
             # 兜底：本实例未 duck，但磁盘上存在遗留静音标记（进程重启后的首次
             # 释放）→ 仍然解除静音，避免泄漏的静音永久粘在系统上
             orphan_release = False

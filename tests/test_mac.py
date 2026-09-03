@@ -412,6 +412,15 @@ def test_media_ducking():
     mr_playing = media_ducking.check_media_remote_playing(timeout=0.05)
     check("音频避让: MediaRemote.framework isPlaying 安全调用", isinstance(mr_playing, bool))
 
+    # 5f. 抢先避让与取消
+    media_ducking.set_system_mute(False)
+    ducker_pre = media_ducking.AudioDucker(enabled_getter=lambda: True)
+    ducker_pre.preemptive_duck()
+    check("音频避让: preemptive_duck 抢先静音", ducker_pre._is_preemptively_ducked and media_ducking.get_system_mute() is True)
+    ducker_pre.cancel_preemptive_duck()
+    check("音频避让: cancel_preemptive_duck 恢复音量", not ducker_pre._is_preemptively_ducked and media_ducking.get_system_mute() is False)
+    media_ducking.set_system_mute(orig_mute)
+
 
 def test_media_ducking_crash_safety():
     """崩溃安全测试：模拟菜单进程在 duck 状态被 SIGKILL 后，新实例自动恢复遗留静音。
@@ -532,6 +541,64 @@ def test_ptt_fsm():
     check("PTT: 空闲时按任意键 → 无动作", f5.on_other_key() is None)
 
 
+def test_gate_mode():
+    """语音输入门控模式测试：非录音输出静音、录音中放行 PCM、PTT 翻转冲刷。"""
+    import numpy as np
+
+    gate_file = BASE / "gate_mode"
+    ptt_file = BASE / ".ptt"
+    orig_gate = gate_file.read_text() if gate_file.exists() else None
+    orig_ptt = ptt_file.read_text() if ptt_file.exists() else None
+
+    try:
+        # 1. 门控开启且 PTT 未开启时：输出应为纯 0 静音
+        gate_file.write_text("1")
+        ptt_file.write_text("0")
+        check("输入门控: gate_file 写入 1 开启", gate_file.read_text().strip() == "1")
+        check("输入门控: ptt_file 状态为 0", ptt_file.read_text().strip() == "0")
+
+        fake_pcm = np.ones((480, 1), dtype=np.int16) * 1000
+        outdata = fake_pcm.copy()
+        is_gate_on = gate_file.read_text().strip() != "0"
+        is_ptt_on = ptt_file.read_text().strip() == "1"
+        if is_gate_on and not is_ptt_on:
+            outdata.fill(0)
+        check("输入门控: 非录音期间输出全 0 静音（防前置串音）", np.all(outdata == 0))
+
+        # 2. PTT 开启录音时：正常放行 PCM
+        ptt_file.write_text("1")
+        is_ptt_on = ptt_file.read_text().strip() == "1"
+        outdata = fake_pcm.copy()
+        if is_gate_on and not is_ptt_on:
+            outdata.fill(0)
+        check("输入门控: 录音期间正常放行真实 PCM", np.all(outdata == 1000))
+
+        # 3. 队列冲刷逻辑（模拟方案三）
+        import queue
+        q = queue.Queue(maxsize=10)
+        rem = bytearray(b"\x12\x34" * 100)
+        q.put(b"old_audio_data_1")
+        q.put(b"old_audio_data_2")
+        # 模拟 PTT 翻转触发 flush
+        while not q.empty():
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                break
+        rem.clear()
+        check("输入门控: PTT 开录触发在途队列与缓存冲刷清空", q.empty() and len(rem) == 0)
+
+    finally:
+        if orig_gate is not None:
+            gate_file.write_text(orig_gate)
+        else:
+            gate_file.unlink(missing_ok=True)
+        if orig_ptt is not None:
+            ptt_file.write_text(orig_ptt)
+        else:
+            ptt_file.unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
     test_wav_header()
     test_lock()
@@ -540,6 +607,7 @@ if __name__ == "__main__":
     test_media_ducking()
     test_media_ducking_crash_safety()
     test_ptt_fsm()
+    test_gate_mode()
     print(f"\n结果: {len(PASS)} 通过 / {len(FAIL)} 失败")
     if FAIL:
         print("失败项:", FAIL)

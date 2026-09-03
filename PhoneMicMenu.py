@@ -25,6 +25,7 @@ LEVEL_FILE = BASE / ".level"
 DENOISE_FILE = BASE / "denoise"
 RECORD_FILE = BASE / "record"
 DUCK_FILE = BASE / "auto_duck"           # 录音期间自动暂停/恢复背景音（默认开启 "1"）
+GATE_FILE = BASE / "gate_mode"           # 语音输入门控模式（默认开启 "1"：仅录音时开麦，防前置串音；"0"=常开全通）
 PTT_FILE = BASE / ".ptt"                 # 右 Option 按住状态（引擎读取，PTT 录音）
 REC_DIR = BASE / "recordings"
 RECONNECT_FILE = BASE / ".reconnect"     # 「立即重连」信号（引擎等待循环轮询消费）
@@ -203,7 +204,7 @@ class PTTFsm:
         return None
 
 
-def start_ptt_listener(on_state, on_error, on_mode=None):
+def start_ptt_listener(on_state, on_error, on_mode=None, on_arm=None, on_disarm=None):
     """监听录音按键（对齐微信输入法交互）：右⌥ 单击开始；录音中按任意键结束。
 
     优先用 HID 层 listen-only 事件 tap：在微信输入法（WeType）等拦截软件
@@ -211,7 +212,8 @@ def start_ptt_listener(on_state, on_error, on_mode=None):
     无「输入监控」权限时降级为轮询 CGEventSourceFlagsState（公开 API 免权限，
     但被输入法拦截的按键会看不到，且无法感知"任意键结束"）。
     on_state(active) 在录音开关状态变化时回调；on_error(msg) 在两种方案都不可用时回调；
-    on_mode(mode) 回调当前方案（"tap"=事件监听 / "poll"=轮询降级）。
+    on_mode(mode) 回调当前方案（"tap"=事件监听 / "poll"=轮询降级）；
+    on_arm() 在右 Option 按下瞬间触发抢先避让；on_disarm() 在判定组合键取消时触发撤回抢先避让。
     """
     def run():
         try:
@@ -247,10 +249,20 @@ def start_ptt_listener(on_state, on_error, on_mode=None):
             if t is not None:
                 t.cancel()
                 pending_timer["t"] = None
+                if on_disarm:
+                    try:
+                        on_disarm()
+                    except Exception:
+                        pass
 
         def _act(action, why):
             if action == "arm":
                 _cancel_pending_timer()
+                if on_arm:
+                    try:
+                        on_arm()
+                    except Exception:
+                        pass
                 t = threading.Timer(fsm.window, _on_timeout)
                 t.daemon = True
                 pending_timer["t"] = t
@@ -291,16 +303,22 @@ def start_ptt_listener(on_state, on_error, on_mode=None):
                             action = fsm.on_right_option_press()
                             if action:
                                 _act(action, "按下右⌥")
+                            else:
+                                _cancel_pending_timer()
                         # 松开：不产生动作（维持 FSM 现状）
                     elif keycode in mod_flags and flags & mod_flags[keycode]:
                         # 其他修饰键按下沿：等价"任意键"
                         action = fsm.on_other_key()
                         if action:
                             _act(action, f"修饰键 keycode={keycode}")
+                        else:
+                            _cancel_pending_timer()
                 elif etype == Quartz.kCGEventKeyDown:
                     action = fsm.on_other_key()
                     if action:
                         _act(action, f"按键 keycode={keycode}")
+                    else:
+                        _cancel_pending_timer()
             except Exception:
                 pass
             return event
@@ -420,6 +438,8 @@ class PhoneMicMenu(rumps.App):
         self.item_rec.state = self._flag_on(RECORD_FILE)
         self.item_duck = rumps.MenuItem("录音时自动暂停背景音（防串音）", callback=self.on_duck)
         self.item_duck.state = self._flag_on(DUCK_FILE, default=1)
+        self.item_gate = rumps.MenuItem("语音输入门控模式（仅录音时开麦，防前置串音）", callback=self.on_gate)
+        self.item_gate.state = self._flag_on(GATE_FILE, default=1)
         self.item_ptt = rumps.MenuItem("PTT 监听：等待权限…", callback=None)
         self.ptt_error = None
         self.ptt_mode = None
@@ -448,7 +468,7 @@ class PhoneMicMenu(rumps.App):
             ["输出增益（电脑侧微调）", gain_items],
             None,
             self.item_ptt,
-            self.item_duck, self.item_denoise, self.item_rec, self.item_open_rec,
+            self.item_duck, self.item_gate, self.item_denoise, self.item_rec, self.item_open_rec,
             self.item_sys, self.item_pair, self.item_reconnect,
             self.item_toggle, self.item_autostart, None
         ]
@@ -468,6 +488,8 @@ class PhoneMicMenu(rumps.App):
             on_state=self._on_ptt_state_changed,
             on_error=_on_ptt_error,
             on_mode=lambda m: setattr(self, "ptt_mode", m),
+            on_arm=self._on_ptt_arm,
+            on_disarm=self._on_ptt_disarm,
         )
         # 孤儿状态清理：若上次异常退出把系统输入留在 BlackHole 且未开启接管，则还原
         try:
@@ -576,6 +598,15 @@ class PhoneMicMenu(rumps.App):
                 except Exception:
                     pass
 
+    def _on_ptt_arm(self):
+        """右 Option 硬件按下瞬间抢先静音系统输出（微秒级，消除 0.22s 判定等待期间扬声器漏音）。"""
+        if self._flag_on(DUCK_FILE, default=1) and self.status == "streaming":
+            self.ducker.preemptive_duck()
+
+    def _on_ptt_disarm(self):
+        """组合键跟进等判定取消录音时，撤销抢先静音。"""
+        self.ducker.cancel_preemptive_duck()
+
     def _on_ptt_state_changed(self, active: bool):
         """右 Option 切换：同步更新 PTT 状态，并自动暂停/恢复背景音。"""
         self.ptt_active = active
@@ -586,6 +617,7 @@ class PhoneMicMenu(rumps.App):
                              f"，状态={self.status}）")
         if active:
             if self.status != "streaming":
+                self.ducker.cancel_preemptive_duck()
                 _play_sound("Basso")
                 _show_notification("PhoneMic 未连通", "手机麦克风未连通（正在寻找中），语音输入暂不可用", sound="Basso")
                 self.refresh()
@@ -620,6 +652,15 @@ class PhoneMicMenu(rumps.App):
             pass
         if not new_state and self.ducker.is_ducked:
             self.ducker.unduck()
+
+    def on_gate(self, sender):
+        new_state = not self._flag_on(GATE_FILE, default=1)
+        try:
+            GATE_FILE.write_text("1" if new_state else "0")
+            sender.state = 1 if new_state else 0
+        except Exception:
+            pass
+        debuglog.log("menu", f"切换语音输入门控模式 → {'开（仅录音时开麦，防前置串音）' if new_state else '关（常开全通）'}")
 
     def on_gain(self, sender):
         try:
