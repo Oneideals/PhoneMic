@@ -524,6 +524,7 @@ class PhoneMicMenu(rumps.App):
             [PYTHON, str(ENGINE), "--auto"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1,
+            cwd=str(BASE),
         )
         self.should_run = True
         self.status = "connecting"
@@ -617,6 +618,11 @@ class PhoneMicMenu(rumps.App):
                              f"，引擎={'在跑' if self.proc and self.proc.poll() is None else '未运行'}"
                              f"，状态={self.status}）")
         if active:
+            # 虚拟声卡自愈守卫：录音前确保 BlackHole 未被外部会议软件静音
+            try:
+                self.ducker.ensure_device_unmuted(BLACKHOLE_NAME)
+            except Exception:
+                pass
             if self.status != "streaming":
                 self.ducker.cancel_preemptive_duck()
                 _play_sound("Basso")
@@ -719,6 +725,11 @@ class PhoneMicMenu(rumps.App):
             return False
 
     def _take_sys_input(self):
+        # 虚拟声卡自愈守卫：接管前清除 BlackHole 上的历史静音与零音量
+        try:
+            self.ducker.ensure_device_unmuted(BLACKHOLE_NAME)
+        except Exception:
+            pass
         prev = self._query_input()
         if prev and "BlackHole" not in prev:
             try:

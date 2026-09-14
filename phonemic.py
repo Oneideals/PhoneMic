@@ -425,6 +425,21 @@ def find_adb_path() -> str | None:
     return None
 
 
+def find_ffmpeg_path() -> str | None:
+    """查找系统中的 ffmpeg 可执行文件路径（兼容 launchd 守护进程等缺失 Homebrew PATH 场景）。"""
+    if shutil.which("ffmpeg"):
+        return shutil.which("ffmpeg")
+    candidates = [
+        Path("/opt/homebrew/bin/ffmpeg"),
+        Path("/usr/local/bin/ffmpeg"),
+        Path.home() / "bin/ffmpeg",
+    ]
+    for p in candidates:
+        if p.exists() and os.access(p, os.X_OK):
+            return str(p)
+    return None
+
+
 USB_URL = "http://127.0.0.1:58083"
 
 
@@ -614,6 +629,12 @@ def probe_ok(url: str, timeout: float = 2.0) -> bool:
 def find_output(hint: str) -> tuple[int, str]:
     for i, d in enumerate(sd.query_devices()):
         if d["max_output_channels"] > 0 and hint.lower() in d["name"].lower():
+            # 虚拟声卡自愈守卫：强制确保 BlackHole 未被外部会议软件静音且音量正常
+            try:
+                import media_ducking
+                media_ducking.ensure_device_unmuted(d["name"])
+            except Exception:
+                pass
             return i, d["name"]
     sys.exit(f"错误：找不到包含 '{hint}' 的输出设备。请确认已安装 BlackHole（--list 可查看全部设备）")
 
@@ -935,14 +956,15 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
         denoise = flag.exists() and flag.read_text().strip() == "1"
     except Exception:
         pass
-    if denoise and ch == 1 and bits == 16:
+    ffmpeg_bin = find_ffmpeg_path()
+    if denoise and ch == 1 and bits == 16 and ffmpeg_bin:
         try:
             # highpass=f=85:poles=2: 二阶 Butterworth 高通彻底切除 <85Hz 桌面震动与握持风噪；
             # afftdn=nr=12:nf=-48:tn=1:gs=4: 噪声底 -48dBFS 对齐实测底噪，tn=1 跟踪风扇变化，gs=4 平滑频域彻底消除金属电音；
             # lowpass=f=12000:poles=1: 滤除 >12kHz 开关电源与高频杂散底噪，听感更沉静温暖
             flt_chain = "highpass=f=85:poles=2,afftdn=nr=12:nf=-48:tn=1:gs=4,lowpass=f=12000:poles=1"
             ff = subprocess.Popen(
-                ["ffmpeg", "-hide_banner", "-loglevel", "error",
+                [ffmpeg_bin, "-hide_banner", "-loglevel", "error",
                  "-fflags", "nobuffer", "-flags", "low_delay",
                  "-probesize", "32", "-analyzeduration", "0",
                  "-f", "s16le", "-ar", str(rate), "-ac", "1", "-i", "pipe:0",

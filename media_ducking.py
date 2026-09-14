@@ -14,7 +14,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Union
 
 # ---------- CoreAudio 系统输出静音控制 ----------
 
@@ -35,13 +35,144 @@ class _AudioObjectPropertyAddress(ctypes.Structure):
     ]
 
 
+_kAudioHardwarePropertyDevices = 0x64657623              # 'dev#'
 _kAudioHardwarePropertyDefaultOutputDevice = 0x644F7574  # 'dOut'
 _kAudioObjectSystemObject = 1
 _kAudioObjectPropertyScopeGlobal = 0x676C6F62           # 'glob'
+_kAudioObjectPropertyScopeInput = 0x696E7074            # 'inpt'
 _kAudioObjectPropertyScopeOutput = 0x6F757470           # 'outp'
+_kAudioDevicePropertyDeviceNameCFString = 0x6C6E616D    # 'lnam'
 _kAudioDevicePropertyMute = 0x6D757465                  # 'mute'
 _kAudioDevicePropertyVolumeScalar = 0x766F6C6D          # 'volm'
 _kAudioObjectPropertyElementMain = 0                    # 0
+
+
+def get_audio_device_by_name(name_substr: str) -> Optional[int]:
+    """通过名称子串（如 'BlackHole'）检索 CoreAudio 设备 ID。"""
+    if not _core_audio:
+        return None
+    try:
+        addr = _AudioObjectPropertyAddress(
+            _kAudioHardwarePropertyDevices,
+            _kAudioObjectPropertyScopeGlobal,
+            _kAudioObjectPropertyElementMain,
+        )
+        size = ctypes.c_uint32(0)
+        status = _core_audio.AudioObjectGetPropertyDataSize(
+            _kAudioObjectSystemObject,
+            ctypes.byref(addr),
+            0,
+            None,
+            ctypes.byref(size),
+        )
+        if status != 0 or size.value == 0:
+            return None
+        count = size.value // ctypes.sizeof(ctypes.c_uint32)
+        dev_ids = (ctypes.c_uint32 * count)()
+        status = _core_audio.AudioObjectGetPropertyData(
+            _kAudioObjectSystemObject,
+            ctypes.byref(addr),
+            0,
+            None,
+            ctypes.byref(size),
+            ctypes.byref(dev_ids),
+        )
+        if status != 0:
+            return None
+
+        cf = None
+        try:
+            cf = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
+            cf.CFStringGetCStringPtr.restype = ctypes.c_char_p
+            cf.CFRelease.argtypes = [ctypes.c_void_p]
+        except Exception:
+            pass
+
+        target_lower = name_substr.lower()
+        for did in dev_ids:
+            cf_name = ctypes.c_void_p()
+            name_addr = _AudioObjectPropertyAddress(
+                _kAudioDevicePropertyDeviceNameCFString,
+                _kAudioObjectPropertyScopeGlobal,
+                _kAudioObjectPropertyElementMain,
+            )
+            name_size = ctypes.c_uint32(ctypes.sizeof(ctypes.c_void_p))
+            res = _core_audio.AudioObjectGetPropertyData(
+                did,
+                ctypes.byref(name_addr),
+                0,
+                None,
+                ctypes.byref(name_size),
+                ctypes.byref(cf_name),
+            )
+            if res == 0 and cf_name.value:
+                try:
+                    c_str = cf.CFStringGetCStringPtr(cf_name, 0x08000100) if cf else None
+                    dev_name = c_str.decode("utf-8") if c_str else ""
+                finally:
+                    if cf and cf_name.value:
+                        try:
+                            cf.CFRelease(cf_name)
+                        except Exception:
+                            pass
+                if target_lower in dev_name.lower():
+                    return int(did)
+    except Exception:
+        pass
+    return None
+
+
+def ensure_device_unmuted(device: Union[int, str] = "BlackHole") -> bool:
+    """强制解除指定音频设备（支持设备 ID 或名称关键字如 BlackHole）的静音并保证满音量。
+
+    针对虚拟声卡（如 BlackHole 2ch）无硬件复位自愈能力的缺陷：
+    当第三方会议软件（腾讯会议、Zoom等）或系统快捷键静音麦克风时，
+    BlackHole 的 Input/Output 会被置为 muted=1 且永久粘滞在 coreaudiod 中。
+    此函数主动巡检并清除静音，彻底杜绝微信输入法等外部软件采集到全 0 哑音。
+    """
+    if not _core_audio:
+        return False
+    dev_id = device if isinstance(device, int) else get_audio_device_by_name(device)
+    if not dev_id:
+        return False
+
+    success = False
+    for scope in (_kAudioObjectPropertyScopeInput, _kAudioObjectPropertyScopeOutput):
+        for elem in (_kAudioObjectPropertyElementMain, 1, 2):
+            try:
+                # 1. 解除静音（muted -> 0）
+                addr_mute = _AudioObjectPropertyAddress(_kAudioDevicePropertyMute, scope, elem)
+                muted = ctypes.c_uint32(0)
+                sz = ctypes.c_uint32(ctypes.sizeof(muted))
+                status = _core_audio.AudioObjectGetPropertyData(
+                    dev_id, ctypes.byref(addr_mute), 0, None, ctypes.byref(sz), ctypes.byref(muted)
+                )
+                if status == 0 and muted.value != 0:
+                    val = ctypes.c_uint32(0)
+                    set_status = _core_audio.AudioObjectSetPropertyData(
+                        dev_id, ctypes.byref(addr_mute), 0, None, sz, ctypes.byref(val)
+                    )
+                    if set_status == 0:
+                        success = True
+                elif status == 0:
+                    success = True
+
+                # 2. 检查音量，若音量过小（< 0.05），提升至 1.0
+                addr_vol = _AudioObjectPropertyAddress(_kAudioDevicePropertyVolumeScalar, scope, elem)
+                vol = ctypes.c_float(0.0)
+                sz_vol = ctypes.c_uint32(ctypes.sizeof(vol))
+                v_status = _core_audio.AudioObjectGetPropertyData(
+                    dev_id, ctypes.byref(addr_vol), 0, None, ctypes.byref(sz_vol), ctypes.byref(vol)
+                )
+                if v_status == 0 and vol.value < 0.05:
+                    full_vol = ctypes.c_float(1.0)
+                    _core_audio.AudioObjectSetPropertyData(
+                        dev_id, ctypes.byref(addr_vol), 0, None, sz_vol, ctypes.byref(full_vol)
+                    )
+            except Exception:
+                pass
+
+    return success
 
 
 def get_default_output_device_id() -> Optional[int]:
@@ -488,3 +619,8 @@ class AudioDucker:
     def cleanup(self) -> None:
         """进程退出前清理状态，防止系统遗留静音。"""
         self.unduck()
+
+    def ensure_device_unmuted(self, device: Union[int, str] = "BlackHole") -> bool:
+        """委托全局 ensure_device_unmuted，确保指定虚拟声卡未被外部静音。"""
+        return ensure_device_unmuted(device)
+

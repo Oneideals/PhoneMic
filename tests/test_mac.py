@@ -599,6 +599,45 @@ def test_gate_mode():
             ptt_file.unlink(missing_ok=True)
 
 
+def test_device_unmute_self_healing():
+    """测试虚拟声卡自愈守卫：外部（会议软件/系统）静音或音量归零时，可成功探测并自愈解除。"""
+    import media_ducking
+    import ctypes
+    import phonemic
+
+    ffmpeg_path = phonemic.find_ffmpeg_path()
+    check("环境探测: find_ffmpeg_path 探测到系统 ffmpeg", ffmpeg_path is not None and "ffmpeg" in ffmpeg_path)
+
+    dev_id = media_ducking.get_audio_device_by_name("BlackHole")
+    check("声卡自愈: 成功检索 BlackHole CoreAudio 设备 ID", dev_id is not None)
+    if not dev_id:
+        return
+
+    # 1. 模拟外部静音（将 BlackHole Input 和 Output 置为 muted=1）
+    ca = media_ducking._core_audio
+    for scope in (media_ducking._kAudioObjectPropertyScopeInput, media_ducking._kAudioObjectPropertyScopeOutput):
+        addr_mute = media_ducking._AudioObjectPropertyAddress(
+            media_ducking._kAudioDevicePropertyMute, scope, 0
+        )
+        val = ctypes.c_uint32(1)
+        ca.AudioObjectSetPropertyData(dev_id, ctypes.byref(addr_mute), 0, None, ctypes.sizeof(val), ctypes.byref(val))
+
+    # 2. 执行自愈守卫
+    ok = media_ducking.ensure_device_unmuted("BlackHole")
+    check("声卡自愈: ensure_device_unmuted 执行成功", ok is True)
+
+    # 3. 验证静音已全部被解除
+    for scope_name, scope in [("Input", media_ducking._kAudioObjectPropertyScopeInput),
+                              ("Output", media_ducking._kAudioObjectPropertyScopeOutput)]:
+        addr_mute = media_ducking._AudioObjectPropertyAddress(
+            media_ducking._kAudioDevicePropertyMute, scope, 0
+        )
+        muted = ctypes.c_uint32(1)
+        sz = ctypes.c_uint32(ctypes.sizeof(muted))
+        ca.AudioObjectGetPropertyData(dev_id, ctypes.byref(addr_mute), 0, None, ctypes.byref(sz), ctypes.byref(muted))
+        check(f"声卡自愈: {scope_name} 静音已被清除（muted=0）", muted.value == 0)
+
+
 if __name__ == "__main__":
     test_wav_header()
     test_lock()
@@ -608,7 +647,9 @@ if __name__ == "__main__":
     test_media_ducking_crash_safety()
     test_ptt_fsm()
     test_gate_mode()
+    test_device_unmute_self_healing()
     print(f"\n结果: {len(PASS)} 通过 / {len(FAIL)} 失败")
     if FAIL:
         print("失败项:", FAIL)
         sys.exit(1)
+
