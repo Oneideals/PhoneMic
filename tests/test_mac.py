@@ -266,10 +266,10 @@ def test_stream_and_sigterm():
             p2.kill()
         check("SIGTERM: 按住中退出，引擎 10 秒内完成收尾", exited2)
         # join 在途转码线程后进程才退出，源 WAV 删除应已完成（防 daemon 竞态残留）
-        wav_left = [f.name for f in rec_dir.glob("*.wav")]
+        wav_left = [f.name for f in rec_dir.glob("*.wav") if f not in stamp_before2]
         check("SIGTERM: 退出后无残留 WAV（转码收尾完整）", len(wav_left) == 0,
               f"left={wav_left}")
-        flac_all = sorted(rec_dir.glob("*.flac"))
+        flac_all = sorted(f for f in rec_dir.glob("*.flac") if f not in stamp_before2)
         check("SIGTERM: 按住中的段已转存 FLAC", len(flac_all) >= 2,
               f"flacs={[f.name for f in flac_all]}")
         PTT.write_text("0")

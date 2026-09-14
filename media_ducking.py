@@ -154,6 +154,12 @@ def ensure_device_unmuted(device: Union[int, str] = "BlackHole") -> bool:
                     )
                     if set_status == 0:
                         success = True
+                        try:
+                            import debuglog
+                            scope_str = "Input" if scope == _kAudioObjectPropertyScopeInput else "Output"
+                            debuglog.log("ducker", f"⚡ 虚拟声卡自愈守卫：检测到 {device} {scope_str} 通道被外部静音，已自动清除静音恢复拾音")
+                        except Exception:
+                            pass
                 elif status == 0:
                     success = True
 
@@ -173,6 +179,53 @@ def ensure_device_unmuted(device: Union[int, str] = "BlackHole") -> bool:
                 pass
 
     return success
+
+
+def diagnose_device(device: Union[int, str] = "BlackHole") -> dict:
+    """全面诊断指定音频设备的健康状态（ID、存在性、Input/Output 静音位与音量）。"""
+    report = {
+        "exists": False,
+        "device_id": None,
+        "input_muted": False,
+        "output_muted": False,
+        "input_volume": 1.0,
+        "output_volume": 1.0,
+    }
+    if not _core_audio:
+        return report
+    dev_id = device if isinstance(device, int) else get_audio_device_by_name(device)
+    if not dev_id:
+        return report
+
+    report["exists"] = True
+    report["device_id"] = dev_id
+
+    for scope, key_muted, key_vol in (
+        (_kAudioObjectPropertyScopeInput, "input_muted", "input_volume"),
+        (_kAudioObjectPropertyScopeOutput, "output_muted", "output_volume"),
+    ):
+        for elem in (_kAudioObjectPropertyElementMain, 1):
+            try:
+                addr_mute = _AudioObjectPropertyAddress(_kAudioDevicePropertyMute, scope, elem)
+                muted = ctypes.c_uint32(0)
+                sz = ctypes.c_uint32(ctypes.sizeof(muted))
+                status = _core_audio.AudioObjectGetPropertyData(
+                    dev_id, ctypes.byref(addr_mute), 0, None, ctypes.byref(sz), ctypes.byref(muted)
+                )
+                if status == 0 and muted.value != 0:
+                    report[key_muted] = True
+
+                addr_vol = _AudioObjectPropertyAddress(_kAudioDevicePropertyVolumeScalar, scope, elem)
+                vol = ctypes.c_float(0.0)
+                sz_vol = ctypes.c_uint32(ctypes.sizeof(vol))
+                v_status = _core_audio.AudioObjectGetPropertyData(
+                    dev_id, ctypes.byref(addr_vol), 0, None, ctypes.byref(sz_vol), ctypes.byref(vol)
+                )
+                if v_status == 0:
+                    report[key_vol] = float(vol.value)
+            except Exception:
+                pass
+    return report
 
 
 def get_default_output_device_id() -> Optional[int]:
@@ -623,4 +676,8 @@ class AudioDucker:
     def ensure_device_unmuted(self, device: Union[int, str] = "BlackHole") -> bool:
         """委托全局 ensure_device_unmuted，确保指定虚拟声卡未被外部静音。"""
         return ensure_device_unmuted(device)
+
+    def diagnose_device(self, device: Union[int, str] = "BlackHole") -> dict:
+        """委托全局 diagnose_device，诊断指定音频设备状态。"""
+        return diagnose_device(device)
 

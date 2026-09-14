@@ -1050,6 +1050,7 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
     rem = bytearray()
     ptt_sync = {"on": False, "t": 0.0}
     gate_sync = {"on": True, "t": 0.0}
+    fade_state = {"ramp_left": 0}
 
     def callback(outdata, frames, _t, _status):
         if not hb["cb_started"]:
@@ -1068,7 +1069,7 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
                 cur_ptt = PTT_FILE.exists() and PTT_FILE.read_text().strip() == "1"
             except Exception:
                 cur_ptt = False
-            # 方案三：检测到 PTT 翻转为开（录音开始瞬间）→ 立即冲刷清空在途队列与缓存
+            # 方案三：检测到 PTT 翻转为开（录音开始瞬间）→ 立即冲刷清空在途队列与缓存，并触发 5ms 平滑淡入防爆音
             if cur_ptt and not ptt_sync["on"]:
                 while not q.empty():
                     try:
@@ -1076,6 +1077,7 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
                     except queue.Empty:
                         break
                 rem.clear()
+                fade_state["ramp_left"] = 240  # 48kHz 下 240 采样 = 5ms 线性平滑淡入
             ptt_sync["on"] = cur_ptt
 
         # 2. 定期同步门控开关配置（200ms 周期，默认开启）
@@ -1112,14 +1114,29 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
                 outdata.fill(0)
             else:
                 outdata[:] = np.frombuffer(data, dtype=dtype).reshape(frames, ch)
+
+        # 门控恢复输出瞬间做 5ms 线性平滑淡入，根除 0 阶跃突变带来的爆音/ASR 截断
+        if fade_state["ramp_left"] > 0 and (not gate_sync["on"] or ptt_sync["on"]):
+            ramp_len = min(frames, fade_state["ramp_left"])
+            ramp = np.linspace(
+                1.0 - (fade_state["ramp_left"] / 240.0),
+                1.0 - ((fade_state["ramp_left"] - ramp_len) / 240.0),
+                ramp_len,
+                dtype=np.float32,
+            )
+            for c in range(ch):
+                outdata[:ramp_len, c] = (outdata[:ramp_len, c].astype(np.float32) * ramp).astype(dtype)
+            fade_state["ramp_left"] -= ramp_len
+
         stat["peak"] = max(peak, stat.get("peak", 0) * 85 // 100)
 
     t = threading.Thread(target=producer, daemon=True)
     t.start()
 
     def watchdog():
-        """每 2 秒体检一次：检测 USB 插入无缝升级、信号文件、断流超时与声卡卡死。"""
+        """每 2 秒体检一次：检测 USB 插入无缝升级、信号文件、断流超时、声卡卡死与静音自愈。"""
         warned_data = warned_cb = False
+        last_unmute_check = 0.0
         while not stop.is_set() and t.is_alive():
             time.sleep(2)
             if stop.is_set():
@@ -1183,6 +1200,15 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
                              f"⚠️ 抖动预警：无数据 {since_data:.1f}s "
                              f"（源={hb['src']} 缓冲{buffered:.0f}ms 峰值{stat.get('peak', 0)}%）")
                 continue
+
+            # 5. 常态化声卡硬件不变量自愈（每 4 秒巡检一次，防止会议软件后台静音）
+            if now - last_unmute_check > 4.0:
+                last_unmute_check = now
+                try:
+                    import media_ducking
+                    media_ducking.ensure_device_unmuted(out_name)
+                except Exception:
+                    pass
 
             warned_data = warned_cb = False
             debuglog.log("engine",

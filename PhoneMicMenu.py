@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """PhoneMicMenu — 菜单栏管理图标（图标化状态 + 录音绿色指示）。"""
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -32,7 +33,19 @@ RECONNECT_FILE = BASE / ".reconnect"     # 「立即重连」信号（引擎等�
 SYSINPUT_FILE = BASE / "sysinput"           # 接管系统输入开关（"1"=接管）
 PREV_INPUT_FILE = BASE / ".prev_input"      # 接管前的原输入设备名（用于还原）
 BLACKHOLE_NAME = "BlackHole 2ch"
-SWITCH_TOOL = "/opt/homebrew/bin/SwitchAudioSource"
+
+
+def find_switch_tool() -> str:
+    """查找系统中 SwitchAudioSource CLI 工具路径（兼容 Apple Silicon、Intel 及各种 PATH 场景）。"""
+    if shutil.which("SwitchAudioSource"):
+        return shutil.which("SwitchAudioSource")
+    for p in ("/opt/homebrew/bin/SwitchAudioSource", "/usr/local/bin/SwitchAudioSource"):
+        if Path(p).exists() and os.access(p, os.X_OK):
+            return p
+    return "/opt/homebrew/bin/SwitchAudioSource"
+
+
+SWITCH_TOOL = find_switch_tool()
 GAIN_CHOICES = [0, 3, 6, 9, 12, 15, 18]     # 上限与 phonemic.MAX_GAIN_DB / 手机端保持一致
 RIGHT_OPTION_KEYCODE = 61                   # 右 Option 键码（调试用）
 NX_DEVICERALTKEYMASK = 0x0040               # 右 Option 的设备修饰位（IOLLEvent.h: NX_DEVICERALTKEYMASK）
@@ -448,10 +461,12 @@ class PhoneMicMenu(rumps.App):
         self._last_logged_status = None
         self.item_open_rec = rumps.MenuItem("打开录音文件夹", callback=self.on_open_rec)
         self.item_reconnect = rumps.MenuItem("立即重连手机", callback=self.on_reconnect)
+        self.item_heal = rumps.MenuItem("声卡与输入法一键体检自愈", callback=self.on_heal)
         self.item_pair = rumps.MenuItem("配对：检查中…", callback=self.on_pair)
         self.item_sys = rumps.MenuItem("接管系统输入（断线自动还原）", callback=self.on_sysinput)
         self.item_sys.state = self._flag_on(SYSINPUT_FILE)
         self._sys_switched = False
+        self._last_input_drift_check = 0.0
         self.item_autostart = rumps.MenuItem("开机自启（下次登录生效）",
                                              callback=self.on_autostart)
         self.item_autostart.state = AGENT.exists()
@@ -470,7 +485,7 @@ class PhoneMicMenu(rumps.App):
             None,
             self.item_ptt,
             self.item_duck, self.item_gate, self.item_denoise, self.item_rec, self.item_open_rec,
-            self.item_sys, self.item_pair, self.item_reconnect,
+            self.item_sys, self.item_heal, self.item_pair, self.item_reconnect,
             self.item_toggle, self.item_autostart, None
         ]
         self.sync_gain_state()
@@ -764,6 +779,31 @@ class PhoneMicMenu(rumps.App):
         elif not new_state and self._sys_switched:
             self._restore_sys_input()
 
+    def on_heal(self, sender=None):
+        """一键声卡与输入法健康体检与主动自愈。"""
+        debuglog.log("menu", "触发声卡与输入法一键体检自愈")
+        unmuted = media_ducking.ensure_device_unmuted(BLACKHOLE_NAME)
+        diag = media_ducking.diagnose_device(BLACKHOLE_NAME)
+
+        cur_in = self._query_input()
+        takeover = self._flag_on(SYSINPUT_FILE) == 1
+        if takeover and self.status == "streaming":
+            self._take_sys_input()
+            cur_in = self._query_input()
+
+        status_lines = []
+        if not diag["exists"]:
+            status_lines.append(f"⚠️ 虚拟声卡：未找到 {BLACKHOLE_NAME}")
+        else:
+            in_m = "已清除静音" if diag["input_muted"] or unmuted else "正常"
+            out_m = "已清除静音" if diag["output_muted"] else "正常"
+            status_lines.append(f"✅ 虚拟声卡：就绪（输入={in_m}, 输出={out_m}）")
+
+        status_lines.append(f"🎤 系统输入：{cur_in or '未知'}")
+        msg = " · ".join(status_lines)
+        _show_notification("声卡与输入法体检", msg, sound="Glass")
+        debuglog.log("menu", f"体检自愈结果: {msg}")
+
     def on_open_rec(self, sender):
         try:
             REC_DIR.mkdir(parents=True, exist_ok=True)
@@ -910,6 +950,15 @@ class PhoneMicMenu(rumps.App):
             self._take_sys_input()
         elif (not takeover or self.status != "streaming") and self._sys_switched:
             self._restore_sys_input()
+        elif takeover and self.status == "streaming" and self._sys_switched:
+            # 防系统输入设备漂移：每 5 秒巡检一次系统输入设备，防止蓝牙设备接入或系统意外重置输入设备
+            now_drift = time.time()
+            if now_drift - self._last_input_drift_check > 5.0:
+                self._last_input_drift_check = now_drift
+                cur_in = self._query_input()
+                if cur_in and "blackhole" not in cur_in.lower():
+                    debuglog.log("menu", f"⚠️ 检测到系统输入漂移为 {cur_in!r}，正在自动纠偏回 {BLACKHOLE_NAME}")
+                    self._take_sys_input()
 
         if not self.should_run:
             self._set_icon(self.paths["stopped"])
