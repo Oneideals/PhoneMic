@@ -22,6 +22,7 @@ sys.path.insert(0, str(BASE))
 ANNOUNCE_PORT = 58880
 QUERY_PORT = 58881
 ENV = {**os.environ, "PHONEMIC_NO_USB": "1",
+       "PHONEMIC_NO_MDNS": "1",
        "PHONEMIC_ANNOUNCE_PORT": str(ANNOUNCE_PORT),
        "PHONEMIC_QUERY_PORT": str(QUERY_PORT)}
 

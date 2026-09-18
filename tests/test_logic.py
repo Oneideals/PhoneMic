@@ -367,6 +367,41 @@ def test_fetch_token_rejects_non_token_body():
             srv.shutdown()
 
 
+# ---------- 14. 端口扫描：401 Unauthorized 判定为 PhoneMic 命中 ----------
+
+def test_scan_host_recognizes_401_as_hit():
+    """回归测试：当手机换端口且未配对时，返回 401 Unauthorized。
+    scan_host_for_riff 必须能识别 401 并判定为命中，而不是当成死连接丢弃。
+    """
+    import http.server
+    import phonemic
+
+    class AuthRequiredHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(401)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"pair first")
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), AuthRequiredHandler)
+    port = srv.server_port
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+
+    orig_ports = phonemic.CANDIDATE_PORTS
+    phonemic.CANDIDATE_PORTS = [port]
+    try:
+        hit = phonemic.scan_host_for_riff("127.0.0.1", timeout=0.8)
+        check("端口扫描: 401 Unauthorized 判定为命中", hit == f"http://127.0.0.1:{port}/audio.wav",
+              f"got {hit!r}")
+    finally:
+        phonemic.CANDIDATE_PORTS = orig_ports
+        srv.shutdown()
+
+
 if __name__ == "__main__":
     for fn in (test_lock_preserves_holder_pid,
                test_probe_ok_accepts_udp_url,
@@ -380,7 +415,8 @@ if __name__ == "__main__":
                test_notify_argv_is_parameterised,
                test_recorder_write_failure_is_visible,
                test_token_must_be_wellformed,
-               test_fetch_token_rejects_non_token_body):
+               test_fetch_token_rejects_non_token_body,
+               test_scan_host_recognizes_401_as_hit):
         try:
             fn()
         except Exception as e:

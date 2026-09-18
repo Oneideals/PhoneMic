@@ -29,8 +29,16 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
+
+# 确保即使由 macOS LaunchAgent 或系统 Python 拉起，也能自动接入本项目的 .venv 依赖
+_BASE_VENV = Path(__file__).resolve().parent / ".venv"
+if _BASE_VENV.exists():
+    for _sp in (_BASE_VENV / "lib").glob("python*/site-packages"):
+        if str(_sp) not in sys.path:
+            sys.path.insert(0, str(_sp))
 
 import numpy as np
 import sounddevice as sd
@@ -286,8 +294,94 @@ def acquire_lock() -> bool:
     return True
 
 
+def discover_mdns_dnssd(timeout: float = 2.5) -> str | None:
+    """利用 macOS 系统级 dns-sd 探测局域网手机 _phonemic._tcp 服务。
+
+    macOS 升级后对多网卡与 Python 用户态组播套接字绑定管控趋严，
+    纯 Python zeroconf 容易丢包或收不到广播；系统 dns-sd 直接走 mDNSResponder IPC，
+    零第三方依赖且百毫秒级必中。
+    """
+    if not sys.platform.startswith("darwin"):
+        return None
+    dnssd = shutil.which("dns-sd") or "/usr/bin/dns-sd"
+    if not Path(dnssd).exists():
+        return None
+
+    def _run_cmd(args, stop_pattern, max_wait):
+        try:
+            proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            fd = proc.stdout.fileno()
+            fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+            fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+            deadline = time.time() + max_wait
+            buf = b""
+            while time.time() < deadline:
+                try:
+                    chunk = os.read(fd, 1024)
+                    if chunk:
+                        buf += chunk
+                        if re.search(stop_pattern, buf):
+                            break
+                except (BlockingIOError, OSError):
+                    time.sleep(0.02)
+            proc.terminate()
+            try:
+                proc.wait(timeout=0.2)
+            except Exception:
+                proc.kill()
+            return buf.decode("utf-8", "ignore")
+        except Exception:
+            return ""
+
+    try:
+        # 1. 浏览服务实例（例如获得 PhoneMic）
+        b_out = _run_cmd([dnssd, "-B", "_phonemic._tcp", "."], rb"_phonemic\._tcp\.", timeout * 0.4)
+        instance = None
+        for line in b_out.splitlines():
+            if "Add" in line and "_phonemic._tcp." in line:
+                parts = line.split()
+                idx = parts.index("_phonemic._tcp.")
+                instance = " ".join(parts[idx + 1:])
+                break
+        if not instance:
+            return None
+
+        # 2. 解析实例端口与主机名
+        l_out = _run_cmd([dnssd, "-L", instance, "_phonemic._tcp", "local."], rb"can be reached at", timeout * 0.3)
+        m = re.search(r"can be reached at ([^:\s]+):(\d+)", l_out)
+        if not m:
+            return None
+        host, port = m.group(1), int(m.group(2))
+
+        # 3. 将 local 主机名解析为 IPv4 地址
+        g_out = _run_cmd([dnssd, "-G", "v4", host], rb"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", timeout * 0.3)
+        ip = None
+        for line in g_out.splitlines():
+            ip_m = re.search(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b", line)
+            if ip_m and not ip_m.group(1).startswith("127."):
+                ip = ip_m.group(1)
+                break
+
+        target_host = ip or host
+        return f"http://{target_host}:{port}"
+    except Exception:
+        return None
+
+
 def discover_mdns(timeout: float = 4.0) -> str | None:
-    """在局域网里寻找手机广播的 _phonemic._tcp 服务。"""
+    """在局域网里寻找手机广播的 _phonemic._tcp 服务。
+    
+    macOS 升级后对多网卡与 Python 用户态组播套接字绑定管控趋严，
+    纯 Python zeroconf 容易丢包；系统 dns-sd 直接走 mDNSResponder IPC，百毫秒级必中。
+    在 macOS 优先尝试 dns-sd，未命中或非 macOS 时回退到 zeroconf 库。
+    """
+    if os.environ.get("PHONEMIC_NO_MDNS") == "1":
+        return None   # 集成测试用：别让局域网真手机的 mDNS 广播劫持假手机测试
+
+    hit = discover_mdns_dnssd(timeout=min(timeout, 2.5))
+    if hit:
+        return hit
+
     try:
         from zeroconf import ServiceBrowser, Zeroconf
     except ImportError:
@@ -336,7 +430,7 @@ def discover_mdns(timeout: float = 4.0) -> str | None:
     return next(iter(result), None)
 
 
-def scan_host_for_riff(host: str, timeout: float = 0.6) -> str | None:
+def scan_host_for_riff(host: str, timeout: float = 1.0) -> str | None:
     """并行探测候选端口（手机在已知主机但 mDNS/UDP 都失效时的最后手段）。"""
     hits: dict = {}
 
@@ -349,6 +443,11 @@ def scan_host_for_riff(host: str, timeout: float = 0.6) -> str | None:
             head = resp.read(4)
             resp.close()
             if head == b"RIFF":
+                hits[port] = url
+        except urllib.error.HTTPError as e:
+            # 手机端鉴权拦截：未带 token 或需配对时返回 401 Unauthorized（附带 pair first）
+            # 此时目标端口毫无疑问就是真实的 PhoneMic 服务，必须计为有效命中，驱动后续配对/拉流
+            if e.code == 401:
                 hits[port] = url
         except Exception:
             pass

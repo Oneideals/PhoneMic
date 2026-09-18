@@ -17,7 +17,9 @@ import phonemic   # 复用引擎侧的链路标签/增益上限/配对 token，�
 
 BASE = Path(__file__).resolve().parent   # 项目根（脚本所在目录），保证 clone 到任意位置都能运行
 ENGINE = BASE / "phonemic.py"
-PYTHON = sys.executable
+_VENV_DIR = BASE / ".venv"
+_VENV_PYTHON = _VENV_DIR / "bin" / "python"
+PYTHON = str(_VENV_PYTHON) if _VENV_PYTHON.exists() and os.access(_VENV_PYTHON, os.X_OK) else sys.executable
 AGENT = Path.home() / "Library" / "LaunchAgents" / "com.jerry.phonemic.menu.plist"
 ICON_DIR = BASE / "icons"
 
@@ -535,11 +537,16 @@ class PhoneMicMenu(rumps.App):
     def spawn(self):
         if self.proc and self.proc.poll() is None:
             return
+        env = dict(os.environ)
+        if _VENV_DIR.exists():
+            env["VIRTUAL_ENV"] = str(_VENV_DIR)
+            env["PATH"] = f"{_VENV_DIR / 'bin'}:{env.get('PATH', '')}"
         self.proc = subprocess.Popen(
             [PYTHON, str(ENGINE), "--auto"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1,
             cwd=str(BASE),
+            env=env,
         )
         self.should_run = True
         self.status = "connecting"
