@@ -552,6 +552,11 @@ class PhoneMicMenu(rumps.App):
 
     def __init__(self):
         debuglog.install("menu")
+        # 隐藏 Dock 栏图标：将激活策略锁定为 Accessory（纯菜单栏常驻应用，彻底不进 Dock 与 Cmd+Tab）
+        import AppKit
+        AppKit.NSApplication.sharedApplication().setActivationPolicy_(
+            AppKit.NSApplicationActivationPolicyAccessory
+        )
         _ensure_edit_menu()
         super().__init__(name="PhoneMic", quit_button="退出 PhoneMic")
         self.paths = build_icons()
@@ -1041,6 +1046,9 @@ class PhoneMicMenu(rumps.App):
         nsitem = getattr(getattr(self, "_nsapp", None), "nsstatusitem", None)
         if nsitem:
             import AppKit
+            AppKit.NSApplication.sharedApplication().setActivationPolicy_(
+                AppKit.NSApplicationActivationPolicyAccessory
+            )
             nsitem.setLength_(AppKit.NSSquareStatusItemLength)
             nsitem.setVisible_(True)
             nsitem.setImage_(None)  # 彻底清除 rumps 老接口遗留图片，杜绝双重图片/边距导致的宽度翻倍膨胀
