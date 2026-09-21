@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """PhoneMicMenu — 菜单栏管理图标（图标化状态 + 录音绿色指示）。"""
+import json
 import os
 import shutil
 import signal
@@ -34,6 +35,7 @@ ICON_DIR = BASE / "icons"
 
 GAIN_FILE = BASE / "gain_db"
 LEVEL_FILE = BASE / ".level"
+DIAG_FILE = BASE / ".diag"
 DENOISE_FILE = BASE / "denoise"
 RECORD_FILE = BASE / "record"
 DUCK_FILE = BASE / "auto_duck"           # 录音期间自动暂停/恢复背景音（默认开启 "1"）
@@ -574,10 +576,12 @@ class PhoneMicMenu(rumps.App):
         )
         self.item_status = rumps.MenuItem(TEXTS["stopped"], callback=None)
         self.item_mode = rumps.MenuItem("传输链路：🔍 检测中…", callback=None)
+        self.item_quality = rumps.MenuItem("链路质量：--", callback=None)
         self.item_level = rumps.MenuItem("电平诊断：--", callback=None)
         self.item_toggle = rumps.MenuItem("启动", callback=self.on_toggle)
-        self.item_denoise = rumps.MenuItem("降噪：过滤电脑风扇声", callback=self.on_denoise)
-        self.item_denoise.state = self._flag_on(DENOISE_FILE)
+        self.item_denoise_ai = rumps.MenuItem("⚡ AI 神经网络降噪 (RNN: 滤敲键盘与杂音)", callback=lambda _: self._set_denoise_mode("ai"))
+        self.item_denoise_fft = rumps.MenuItem("🌊 稳态平滑降噪 (FFT: 滤电脑风扇声)", callback=lambda _: self._set_denoise_mode("fft"))
+        self.item_denoise_off = rumps.MenuItem("○ 关闭降噪 (原始原声全通)", callback=lambda _: self._set_denoise_mode("0"))
         self.item_rec = rumps.MenuItem("录音存档（右⌥单击开始 / 录音中按任意键结束）", callback=self.on_record)
         self.item_rec.state = self._flag_on(RECORD_FILE)
         self.item_duck = rumps.MenuItem("录音时自动暂停背景音（防串音）", callback=self.on_duck)
@@ -615,16 +619,19 @@ class PhoneMicMenu(rumps.App):
         self.menu = [
             self.item_status,
             self.item_mode,
+            self.item_quality,
             self.item_level,
             None,
             ["输出增益（电脑侧微调）", gain_items],
+            ["人声降噪模式", [self.item_denoise_ai, self.item_denoise_fft, self.item_denoise_off]],
             None,
             self.item_ptt,
-            self.item_duck, self.item_gate, self.item_denoise, self.item_rec, self.item_open_rec,
+            self.item_duck, self.item_gate, self.item_rec, self.item_open_rec,
             self.item_sys, self.item_heal, self.item_lnp, self.item_pair, self.item_reconnect,
             self.item_toggle, self.item_autostart, None
         ]
         self.sync_gain_state()
+        self.sync_denoise_state()
         # PTT：单击右 Option 切换录音开关，状态写 .ptt 供引擎读取
         try:
             PTT_FILE.write_text("1" if self.ptt_active else "0")
@@ -842,15 +849,46 @@ class PhoneMicMenu(rumps.App):
         for it in self.gain_items:
             it.state = 1 if it._db == cur else 0
 
-    def on_denoise(self, sender):
-        new_state = not self._flag_on(DENOISE_FILE)
+    def _get_denoise_mode(self) -> str:
         try:
-            DENOISE_FILE.write_text("1" if new_state else "0")
-            sender.state = 1 if new_state else 0
-            if self.proc and self.proc.poll() is None:
-                self.proc.terminate()   # watch 线程 2 秒内自动重启引擎
+            if DENOISE_FILE.exists():
+                v = DENOISE_FILE.read_text().strip().lower()
+                if v in ("1", "ai", "rnn", "true"):
+                    return "ai"
+                if v in ("fft", "classic"):
+                    return "fft"
+                return "0"
         except Exception:
             pass
+        return "0"
+
+    def _set_denoise_mode(self, mode: str):
+        try:
+            DENOISE_FILE.write_text(mode)
+        except Exception:
+            pass
+        self.sync_denoise_state()
+        debuglog.log("menu", f"切换人声降噪模式 → {mode}")
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()   # watch 线程 2 秒内自动重启引擎加载新滤镜
+
+    def sync_denoise_state(self):
+        cur = self._get_denoise_mode()
+        target_ai = 1 if cur == "ai" else 0
+        target_fft = 1 if cur == "fft" else 0
+        target_off = 1 if cur in ("0", "off") else 0
+        if self.item_denoise_ai.state != target_ai:
+            self.item_denoise_ai.state = target_ai
+        if self.item_denoise_fft.state != target_fft:
+            self.item_denoise_fft.state = target_fft
+        if self.item_denoise_off.state != target_off:
+            self.item_denoise_off.state = target_off
+
+    def on_denoise(self, sender=None):
+        """兼容老单开关键：在关闭与 AI 降噪之间循环切换。"""
+        cur = self._get_denoise_mode()
+        next_mode = "0" if cur == "ai" else "ai"
+        self._set_denoise_mode(next_mode)
 
     def on_record(self, sender):
         new_state = not self._flag_on(RECORD_FILE)
@@ -941,6 +979,15 @@ class PhoneMicMenu(rumps.App):
             status_lines.append(f"✅ 虚拟声卡：就绪（输入={in_m}, 输出={out_m}）")
 
         status_lines.append(f"🎤 系统输入：{cur_in or '未知'}")
+        if self.status == "streaming" and DIAG_FILE.exists():
+            try:
+                diag = json.loads(DIAG_FILE.read_text())
+                link_m = diag.get("link_mode", "udp").upper()
+                j_ms = diag.get("jitter_ms", 0.0)
+                l_pct = diag.get("loss_pct", 0.0)
+                status_lines.append(f"📶 链路质量：{link_m} 抖动={j_ms}ms 丢包={l_pct}%")
+            except Exception:
+                pass
         if LNP_FLAG_FILE.exists() and self.status != "streaming":
             status_lines.append("⚠️ 本地网络：检测到 macOS 拦截局域网访问（建议插 USB 或前往设置放行）")
         else:
@@ -1097,6 +1144,7 @@ class PhoneMicMenu(rumps.App):
 
     def refresh(self):
         self._ensure_status_button()
+        self.sync_denoise_state()
         # 配对状态
         self._set_title(self.item_pair, "配对：✅ 已配对（点此修改）" if phonemic.load_token()
                                          else "配对：⚠️ 未配对（插 USB 线自动配对，或点此手填）")
@@ -1161,6 +1209,7 @@ class PhoneMicMenu(rumps.App):
             self._set_icon(self.paths["stopped"])
             self._set_title(self.item_status, "○ PhoneMic 已停止")
             self._set_title(self.item_mode, "传输链路：⏸ 已停止")
+            self._set_title(self.item_quality, "链路质量：⏸ 已停止")
             self._set_title(self.item_level, "电平诊断：--")
         elif self.status == "streaming":
             try:
@@ -1181,6 +1230,38 @@ class PhoneMicMenu(rumps.App):
             mode_tag = phonemic.link_mode_label(last_url) or "🔍 探测中…"
             self._set_title(self.item_status, "● 手机麦克风已连通" + status_tag)
             self._set_title(self.item_mode, f"传输链路：{mode_tag}")
+
+            # 读取 .diag 指标文件（P1 质量指标扩展：抖动、丢包、缓冲）
+            diag = None
+            if DIAG_FILE.exists():
+                try:
+                    if time.time() - DIAG_FILE.stat().st_mtime < 2.0:
+                        diag = json.loads(DIAG_FILE.read_text())
+                except Exception:
+                    diag = None
+
+            if diag:
+                j_ms = diag.get("jitter_ms", 0.0)
+                l_pct = diag.get("loss_pct", 0.0)
+                b_ms = diag.get("buffered_ms", 0.0)
+                l_mode = diag.get("link_mode", "udp")
+                if l_mode == "usb":
+                    quality_str = f"链路质量：⚡ 物理直连 (<1ms 抖动 · 0% 丢包 · 缓冲 {b_ms:.0f}ms)"
+                elif l_mode == "udp":
+                    if l_pct == 0.0 and j_ms < 10.0:
+                        verdict_q = "✓ 极佳"
+                    elif l_pct < 1.0 and j_ms < 25.0:
+                        verdict_q = "✓ 良好"
+                    elif l_pct < 3.0:
+                        verdict_q = "⚠️ 偶有抖动"
+                    else:
+                        verdict_q = "⚠️ 建议插 USB 线"
+                    quality_str = f"链路质量：📡 抖动 {j_ms:.1f}ms · 丢包 {l_pct:.1f}% · 缓冲 {b_ms:.0f}ms ({verdict_q})"
+                else:
+                    quality_str = f"链路质量：📶 抖动 {j_ms:.1f}ms · 缓冲 {b_ms:.0f}ms · 0 丢包"
+                self._set_title(self.item_quality, quality_str)
+            else:
+                self._set_title(self.item_quality, "链路质量：📡 探测中…")
 
             self.level_hist.append(lv)
             if len(self.level_hist) > 15:
@@ -1207,6 +1288,7 @@ class PhoneMicMenu(rumps.App):
             self._set_icon(self.paths["connecting"])
             self._set_title(self.item_status, "◐ 正在寻找手机…")
             self._set_title(self.item_mode, "传输链路：🔍 正在探测 USB / UDP / Wi-Fi…")
+            self._set_title(self.item_quality, "链路质量：🔍 探测中…")
             self._set_title(self.item_level, "电平诊断：--")
         self._set_title(self.item_toggle, "停止" if self.should_run else "启动")
 

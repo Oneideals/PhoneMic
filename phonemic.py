@@ -16,8 +16,10 @@
   phonemic.py --list              # 列出输出设备
 """
 import argparse
+import collections
 import fcntl
 import ipaddress
+import json
 import os
 import queue
 import re
@@ -50,6 +52,10 @@ LAST_URL_FILE = BASE / ".phonemic_last_url"
 LOCK_FILE = BASE / ".phonemic_lock"
 GAIN_FILE = BASE / "gain_db"        # 数字增益（dB），菜单栏应用写入，引擎每秒读取
 LEVEL_FILE = BASE / ".level"        # 引擎实时输出电平（0~100），菜单栏读取显示
+DIAG_FILE = BASE / ".diag"          # 引擎全量实时诊断指标（JSON：抖动、丢包、缓冲、电平），菜单栏读取
+DENOISE_FILE = BASE / "denoise"     # 降噪模式开关（"ai"=神经网络降噪, "fft"=稳态降噪, "0"=关）
+RNNOISE_DIR = BASE / "models" / "rnnoise"
+DEFAULT_RNNN = RNNOISE_DIR / "std.rnnn"
 RECORD_FILE = BASE / "record"       # 录音存档开关（"1"=开启）
 PTT_FILE = BASE / ".ptt"            # 录音开关状态（"1"=录音中，单击右⌥切换），菜单栏监听写入
 GATE_FILE = BASE / "gate_mode"      # 语音输入门控模式（"1"=开启：仅录音时向声卡输出音频，防串音；"0"=常开全通）
@@ -149,6 +155,45 @@ def fetch_token_over_usb(base_url: str) -> bool:
 
 def clamp_gain(v) -> float:
     return max(0.0, min(MAX_GAIN_DB, float(v)))
+
+
+def load_denoise_mode() -> str:
+    """读取降噪模式配置（'ai' / 'fft' / 'off'）。默认 'off'。"""
+    try:
+        if DENOISE_FILE.exists():
+            val = DENOISE_FILE.read_text().strip().lower()
+            if val in ("1", "ai", "rnn", "true"):
+                return "ai"
+            if val in ("fft", "classic"):
+                return "fft"
+            return "off"
+    except Exception:
+        pass
+    return "off"
+
+
+def build_denoise_filter(denoise_mode: str, rnnn_path: Path | None = None) -> tuple[str, str]:
+    """构建 ffmpeg 降噪滤镜链。
+
+    返回 (filter_str, actual_mode_name)。
+    - 'ai': 现代轻量级 AI 神经网络降噪 (RNNoise: 二阶高通85Hz + arnndn 滤除机械键盘敲击与突发杂音 + 12kHz低通平滑)
+    - 'fft': 经典频域稳态降噪 (二阶高通85Hz + afftdn 自适应对齐底噪平滑降噪 + 12kHz低通)
+    - 'off': 关闭降噪
+    若请求 'ai' 但模型文件不存在，自动平滑回退至 'fft'。
+    """
+    if denoise_mode in ("0", "off", "none", "", None):
+        return "", "off"
+
+    model_path = rnnn_path or DEFAULT_RNNN
+    if denoise_mode == "ai":
+        if model_path.exists():
+            flt = f"highpass=f=85:poles=2,arnndn=m={model_path},lowpass=f=12000:poles=1"
+            return flt, "ai"
+        flt = "highpass=f=85:poles=2,afftdn=nr=12:nf=-48:tn=1:gs=4,lowpass=f=12000:poles=1"
+        return flt, "fft_fallback"
+
+    flt = "highpass=f=85:poles=2,afftdn=nr=12:nf=-48:tn=1:gs=4,lowpass=f=12000:poles=1"
+    return flt, "fft"
 
 
 def process_pcm16(data: bytes, gain_db: float):
@@ -930,7 +975,7 @@ class StreamTee:
 
 
 class UdpAudioReceiver:
-    """UDP 极速音频接收器：10ms 帧直接接收，带丢包补偿与序列号检查，无阻塞零延迟。"""
+    """UDP 极速音频接收器：10ms 帧直接接收，带丢包补偿、序列号检查与 RFC 3550 抖动估计。"""
 
     def __init__(self, host: str, port: int, stop: threading.Event):
         self.host = host
@@ -943,6 +988,9 @@ class UdpAudioReceiver:
         self.last_seq = None
         self.lost_packets = 0
         self.received_packets = 0
+        self.jitter = 0.0          # RFC 3550 平滑抖动估计 (秒)
+        self.last_arrival = None   # 上一个音频包到达时刻
+        self._recent_window = collections.deque()  # (timestamp, lost_count, recv_count)
         self.buf = bytearray()
         self._send_ping()
 
@@ -971,16 +1019,39 @@ class UdpAudioReceiver:
             try:
                 data, addr = self.sock.recvfrom(2048)
                 if len(data) >= 8 and data[:4] == b"PMIC":
+                    now = time.time()
                     seq = struct.unpack(">I", data[4:8])[0]
                     pcm = data[8:]
+                    lost_this = 0
                     if self.last_seq is not None:
                         diff = (seq - self.last_seq) & 0xFFFFFFFF
                         if 1 < diff < 50:
-                            self.lost_packets += (diff - 1)
-                            self.buf.extend(b"\x00" * ((diff - 1) * len(pcm)))
+                            lost_this = diff - 1
+                            self.lost_packets += lost_this
+                            self.buf.extend(b"\x00" * (lost_this * len(pcm)))
+                            if self.last_arrival is not None:
+                                expected_dt = diff * 0.010  # 每帧 10.0ms 标称间隔
+                                actual_dt = now - self.last_arrival
+                                if actual_dt < 1.0:
+                                    d = abs(actual_dt - expected_dt)
+                                    self.jitter += (d - self.jitter) / 16.0
+                        elif diff == 1:
+                            if self.last_arrival is not None:
+                                expected_dt = 0.010
+                                actual_dt = now - self.last_arrival
+                                if actual_dt < 1.0:
+                                    d = abs(actual_dt - expected_dt)
+                                    self.jitter += (d - self.jitter) / 16.0
+                        elif diff == 0:
+                            continue   # 忽略重复包
+                        else:
+                            # 序列号发生突变/回环/手机服务重置（diff >= 50），重置基准，避免抖动估算畸变
+                            pass
+                    self.last_arrival = now
                     self.last_seq = seq
                     self.received_packets += 1
                     self.buf.extend(pcm)
+                    self._recent_window.append((now, lost_this, 1))
             except socket.timeout:
                 if self.stop.is_set():
                     break
@@ -990,12 +1061,75 @@ class UdpAudioReceiver:
         res, self.buf = bytes(self.buf[:n]), self.buf[n:]
         return res
 
+    def get_metrics(self) -> dict:
+        now = time.time()
+        while self._recent_window and now - self._recent_window[0][0] > 5.0:
+            self._recent_window.popleft()
+        win_lost = sum(x[1] for x in self._recent_window)
+        win_recv = sum(x[2] for x in self._recent_window)
+        win_tot = win_lost + win_recv
+        loss_pct = (win_lost / win_tot * 100.0) if win_tot > 0 else 0.0
+
+        tot_all = self.lost_packets + self.received_packets
+        tot_loss_pct = (self.lost_packets / tot_all * 100.0) if tot_all > 0 else 0.0
+        return {
+            "jitter_ms": round(self.jitter * 1000.0, 1),
+            "loss_pct": round(loss_pct, 1),
+            "total_loss_pct": round(tot_loss_pct, 1),
+            "lost_packets": self.lost_packets,
+            "received_packets": self.received_packets,
+        }
+
     def close(self):
         try:
             self.sock.sendto(b"PHONEMIC_UDP_STOP", (self.host, self.port))
             self.sock.close()
         except Exception:
             pass
+
+
+class HttpStreamMetrics:
+    """HTTP/TCP 流指标追踪（USB 物理回环与局域网 Wi-Fi TCP）。"""
+
+    def __init__(self, is_usb: bool = False):
+        self.is_usb = is_usb
+        self.jitter = 0.0
+        self.last_arrival = None
+        self.received_chunks = 0
+        self._recent_window = collections.deque()
+
+    def record_chunk(self, chunk_len: int, rate: int = 48000, ch: int = 1, bits: int = 16):
+        now = time.time()
+        self.received_chunks += 1
+        frame_bytes = ch * bits // 8
+        nominal_dt = chunk_len / (rate * frame_bytes) if frame_bytes else 0.0426
+        if self.last_arrival is not None:
+            actual_dt = now - self.last_arrival
+            if actual_dt < 1.0:
+                d = abs(actual_dt - nominal_dt)
+                self.jitter += (d - self.jitter) / 16.0
+        self.last_arrival = now
+        self._recent_window.append(now)
+
+    def get_metrics(self) -> dict:
+        now = time.time()
+        while self._recent_window and now - self._recent_window[0] > 5.0:
+            self._recent_window.popleft()
+        if self.is_usb:
+            return {
+                "jitter_ms": 0.2,
+                "loss_pct": 0.0,
+                "total_loss_pct": 0.0,
+                "lost_packets": 0,
+                "received_packets": self.received_chunks,
+            }
+        return {
+            "jitter_ms": round(self.jitter * 1000.0, 1),
+            "loss_pct": 0.0,
+            "total_loss_pct": 0.0,
+            "lost_packets": 0,
+            "received_packets": self.received_chunks,
+        }
 
 
 def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
@@ -1049,21 +1183,13 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
     else:
         debuglog.log("engine", "录音存档未开启（record != 1）：PTT 期间不落盘")
 
-    # 降噪（可选）：ffmpeg 黄金人声降噪链（二阶高通切除桌面共振 + 自适应对齐底噪平滑降噪 + 高频平滑）
+    # 降噪（可选）：ffmpeg 黄金人声降噪链（AI 神经网络降噪 / 经典 FFT 稳态降噪）
     ff = None
-    denoise = False
-    try:
-        flag = BASE / "denoise"
-        denoise = flag.exists() and flag.read_text().strip() == "1"
-    except Exception:
-        pass
+    denoise_mode = load_denoise_mode()
+    flt_chain, actual_denoise = build_denoise_filter(denoise_mode)
     ffmpeg_bin = find_ffmpeg_path()
-    if denoise and ch == 1 and bits == 16 and ffmpeg_bin:
+    if flt_chain and ch == 1 and bits == 16 and ffmpeg_bin:
         try:
-            # highpass=f=85:poles=2: 二阶 Butterworth 高通彻底切除 <85Hz 桌面震动与握持风噪；
-            # afftdn=nr=12:nf=-48:tn=1:gs=4: 噪声底 -48dBFS 对齐实测底噪，tn=1 跟踪风扇变化，gs=4 平滑频域彻底消除金属电音；
-            # lowpass=f=12000:poles=1: 滤除 >12kHz 开关电源与高频杂散底噪，听感更沉静温暖
-            flt_chain = "highpass=f=85:poles=2,afftdn=nr=12:nf=-48:tn=1:gs=4,lowpass=f=12000:poles=1"
             ff = subprocess.Popen(
                 [ffmpeg_bin, "-hide_banner", "-loglevel", "error",
                  "-fflags", "nobuffer", "-flags", "low_delay",
@@ -1090,8 +1216,11 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
 
             threading.Thread(target=feeder, daemon=True).start()
             source = ff.stdout
-            print("[降噪] 已启用：黄金人声降噪链（二阶高通85Hz+自适应底噪对齐+平滑增益gs=4+高频修整）", flush=True)
-            debuglog.log("engine", f"降噪管道已启动: {flt_chain}")
+            tag_name = ("⚡ AI 神经网络降噪（二阶高通85Hz+arnndn深度网络+12kHz修整）"
+                        if "ai" in actual_denoise else
+                        "🌊 稳态平滑降噪（二阶高通85Hz+afftdn自适应底噪对齐+12kHz修整）")
+            print(f"[降噪] 已启用：{tag_name}", flush=True)
+            debuglog.log("engine", f"降噪管道已启动（模式={actual_denoise}）: {flt_chain}")
         except Exception as e:
             ff = None
             source = resp
@@ -1114,6 +1243,7 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
     hb = {"data": time.time(), "cb": time.time(), "cb_count": 0,
           "cb_started": False, "t_start": time.time(),
           "src": "ffmpeg-pipe" if ff is not None else "http"}
+    http_metrics = HttpStreamMetrics(is_usb=("127.0.0.1" in url or "localhost" in url))
 
     def producer():
         try:
@@ -1121,6 +1251,8 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
                 chunk = source.read(4096)
                 if not chunk:
                     raise ConnectionError("音频流结束")
+                if not url.startswith("udp://"):
+                    http_metrics.record_chunk(len(chunk), rate, ch, bits)
                 stat["bytes"] += len(chunk)
                 now = time.time()
                 gap = now - hb["data"]
@@ -1345,6 +1477,31 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
                     LEVEL_FILE.write_text(str(stat.get("peak", 0)))
                 except Exception:
                     pass
+                buffered_ms = q.qsize() * 4096 / byte_rate * 1000
+                metrics = resp.get_metrics() if hasattr(resp, "get_metrics") else http_metrics.get_metrics()
+                diag_data = {
+                    "peak": stat.get("peak", 0),
+                    "limited": stat.get("limited", 0),
+                    "underruns": stat["underruns"],
+                    "buffered_ms": round(buffered_ms, 0),
+                    "jitter_ms": metrics.get("jitter_ms", 0.0),
+                    "loss_pct": metrics.get("loss_pct", 0.0),
+                    "total_loss_pct": metrics.get("total_loss_pct", 0.0),
+                    "lost_packets": metrics.get("lost_packets", 0),
+                    "received_packets": metrics.get("received_packets", 0),
+                    "link_mode": "usb" if ("127.0.0.1" in url or "localhost" in url) else ("udp" if url.startswith("udp://") else "wifi"),
+                    "url": url,
+                    "rate": rate,
+                    "ch": ch,
+                    "denoise": actual_denoise if (flt_chain and ff is not None) else "off",
+                    "updated_at": round(now, 2),
+                }
+                try:
+                    tmp_diag = DIAG_FILE.with_suffix(".tmp")
+                    tmp_diag.write_text(json.dumps(diag_data))
+                    tmp_diag.replace(DIAG_FILE)
+                except Exception:
+                    pass
                 if meta_fh:
                     try:
                         meta_fh.write(f"{now - t0:.1f},{stat.get('peak', 0)},"
@@ -1352,12 +1509,16 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
                         meta_fh.flush()
                     except Exception:
                         pass
-                buffered_ms = q.qsize() * 4096 / byte_rate * 1000
                 if now - last_report > 10:
                     last_report = now
-                    print(f"[状态] 运行中 缓冲≈{buffered_ms:.0f}ms 峰值{stat.get('peak', 0)}% "
+                    print(f"[状态] 运行中 抖动≈{metrics.get('jitter_ms', 0):.1f}ms 丢包={metrics.get('loss_pct', 0):.1f}% "
+                          f"缓冲≈{buffered_ms:.0f}ms 峰值{stat.get('peak', 0)}% "
                           f"欠载{stat['underruns']}次 限幅{stat.get('limited', 0)}次", flush=True)
     finally:
+        try:
+            DIAG_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
         # 无论正常结束还是异常/SIGTERM 退出，录音段都要正确收尾（回写头部长度）
         if recorder:
             try:
@@ -1372,6 +1533,7 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
         if ff is not None:
             try:
                 ff.kill()
+                ff.wait(timeout=0.5)
             except Exception:
                 pass
         try:

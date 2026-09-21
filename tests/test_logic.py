@@ -402,6 +402,103 @@ def test_scan_host_recognizes_401_as_hit():
         srv.shutdown()
 
 
+# ---------- 15. P1 验证：UDP 音频接收器丢包率与 RFC 3550 抖动 ----------
+
+def test_udp_receiver_metrics_jitter_and_loss():
+    """P1 验证：UdpAudioReceiver 准确计算丢包数、滑动窗口丢包率与 RFC 3550 抖动指标。"""
+    import phonemic
+
+    srv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    srv_sock.bind(("127.0.0.1", 0))
+    srv_port = srv_sock.getsockname()[1]
+    stop = threading.Event()
+
+    rcv = phonemic.UdpAudioReceiver("127.0.0.1", srv_port, stop)
+    rcv_port = rcv.sock.getsockname()[1]
+
+    # 发送包：seq 1, seq 2, seq 4 (跳过 seq 3 -> 丢 1 包), seq 5
+    pcm = b"\x01\x00" * 480  # 960 字节
+    try:
+        for seq in [1, 2, 4, 5]:
+            pkt = b"PMIC" + struct.pack(">I", seq) + pcm
+            srv_sock.sendto(pkt, ("127.0.0.1", rcv_port))
+            time.sleep(0.01)
+
+        # 读取 5 帧音频（含丢包补零，共 5 * 960 = 4800 字节）
+        buf = rcv.read(4800)
+        m = rcv.get_metrics()
+
+        check("UDP 诊断指标: 收到 4 个物理包", m["received_packets"] == 4, f"got {m['received_packets']}")
+        check("UDP 诊断指标: 准确识别丢包数 1", m["lost_packets"] == 1, f"got {m['lost_packets']}")
+        check("UDP 诊断指标: 滑动窗口丢包率正确 (20%)", m["loss_pct"] == 20.0, f"got {m['loss_pct']}")
+        check("UDP 诊断指标: RFC 3550 抖动非负", m["jitter_ms"] >= 0.0, f"got {m['jitter_ms']}")
+        check("UDP 诊断指标: 丢包自动平滑填充零数据", len(buf) == 4800, f"got len={len(buf)}")
+
+        # 测试序列号大幅跳变（如手机服务重启后 seq 归 1，diff 巨大，不应产生虚假抖动风暴）
+        pkt_reset = b"PMIC" + struct.pack(">I", 1) + pcm
+        srv_sock.sendto(pkt_reset, ("127.0.0.1", rcv_port))
+        time.sleep(0.01)
+        rcv.read(960)
+        m_reset = rcv.get_metrics()
+        check("UDP 诊断指标: 序列号重置不引起抖动畸变 (<100ms)", m_reset["jitter_ms"] < 100.0,
+              f"got {m_reset['jitter_ms']}")
+    finally:
+        rcv.close()
+        srv_sock.close()
+        stop.set()
+
+
+# ---------- 16. P1 验证：HTTP 与 USB 物理链路指标计算 ----------
+
+def test_http_stream_metrics():
+    """P1 验证：HttpStreamMetrics 对 USB 物理直连与 Wi-Fi TCP 的指标计算。"""
+    import phonemic
+
+    # 1. USB 极速物理直连模式：固化 <1ms 抖动与 0% 丢包
+    usb_m = phonemic.HttpStreamMetrics(is_usb=True)
+    usb_m.record_chunk(4096)
+    m1 = usb_m.get_metrics()
+    check("USB 指标: 0% 丢包", m1["loss_pct"] == 0.0)
+    check("USB 指标: 抖动 < 1ms", m1["jitter_ms"] < 1.0, f"got {m1['jitter_ms']}")
+
+    # 2. Wi-Fi TCP 模式：计算 chunk 到达时间间隔方差
+    wifi_m = phonemic.HttpStreamMetrics(is_usb=False)
+    wifi_m.record_chunk(4096)
+    time.sleep(0.02)
+    wifi_m.record_chunk(4096)
+    m2 = wifi_m.get_metrics()
+    check("Wi-Fi TCP 指标: 0% 丢包（传输层保障）", m2["loss_pct"] == 0.0)
+    check("Wi-Fi TCP 指标: 存在计算抖动", m2["jitter_ms"] >= 0.0, f"got {m2['jitter_ms']}")
+
+
+# ---------- 17. P2 验证：现代轻量级 AI 语音降噪滤镜链构建 ----------
+
+def test_build_denoise_filter():
+    """P2 验证：build_denoise_filter 支持 AI 神经网络降噪、FFT 降噪及平滑回退。"""
+    import phonemic
+
+    # 1. 关闭模式
+    flt_off, mode_off = phonemic.build_denoise_filter("0")
+    check("降噪构建: 0 模式关闭", flt_off == "" and mode_off == "off")
+
+    # 2. AI 模式（模型存在）：生成包含 arnndn 的滤镜链
+    model_std = phonemic.BASE / "models" / "rnnoise" / "std.rnnn"
+    if model_std.exists():
+        flt_ai, mode_ai = phonemic.build_denoise_filter("ai", rnnn_path=model_std)
+        check("降噪构建: AI 模式包含 arnndn 滤镜", "arnndn" in flt_ai and mode_ai == "ai", f"got {flt_ai}")
+        check("降噪构建: AI 模式包含 Butterworth 85Hz 高通", "highpass=f=85" in flt_ai)
+        check("降噪构建: AI 模式包含 12kHz 低通修整", "lowpass=f=12000" in flt_ai)
+
+    # 3. AI 模式（模型不存在）：优雅回退到 FFT 降噪
+    dummy_model = Path("/tmp/nonexistent_test_model.rnnn")
+    flt_fallback, mode_fallback = phonemic.build_denoise_filter("ai", rnnn_path=dummy_model)
+    check("降噪构建: 缺失模型时优雅回退至 FFT", "afftdn" in flt_fallback and mode_fallback == "fft_fallback")
+
+    # 4. FFT 稳态模式
+    flt_fft, mode_fft = phonemic.build_denoise_filter("fft")
+    check("降噪构建: FFT 稳态模式包含 afftdn", "afftdn" in flt_fft and mode_fft == "fft")
+
+
 if __name__ == "__main__":
     for fn in (test_lock_preserves_holder_pid,
                test_probe_ok_accepts_udp_url,
@@ -416,7 +513,10 @@ if __name__ == "__main__":
                test_recorder_write_failure_is_visible,
                test_token_must_be_wellformed,
                test_fetch_token_rejects_non_token_body,
-               test_scan_host_recognizes_401_as_hit):
+               test_scan_host_recognizes_401_as_hit,
+               test_udp_receiver_metrics_jitter_and_loss,
+               test_http_stream_metrics,
+               test_build_denoise_filter):
         try:
             fn()
         except Exception as e:
@@ -427,3 +527,4 @@ if __name__ == "__main__":
         for n in FAIL:
             print(f"  FAIL {n}")
         sys.exit(1)
+

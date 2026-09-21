@@ -13,6 +13,7 @@ android/local.properties
 # 运行时状态（含个人语音数据，严禁入库）
 recordings/
 .level
+.diag
 .phonemic_last_url
 .phonemic_lock
 .phonemic_token
