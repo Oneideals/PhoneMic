@@ -9,8 +9,70 @@ permissions:
   contents: write
 
 jobs:
-  build-and-release:
-    name: Build APK and Create Release
+  build-mac-app:
+    name: Build macOS App
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build PhoneMic.app with PyInstaller
+        run: |
+          pyinstaller \
+            --name PhoneMic \
+            --windowed \
+            --onedir \
+            --noconfirm \
+            --osx-bundle-identifier com.jerry.phonemic \
+            --add-data "phonemic.py:." \
+            --add-data "debuglog.py:." \
+            --add-data "media_ducking.py:." \
+            --add-data "icons:icons" \
+            --add-data "models:models" \
+            --hidden-import rumps \
+            --hidden-import sounddevice \
+            --hidden-import numpy \
+            --hidden-import zeroconf \
+            --hidden-import AppKit \
+            --hidden-import objc \
+            PhoneMicMenu.py
+
+      - name: Set Info.plist keys
+        run: |
+          PLIST="dist/PhoneMic.app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "$PLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Set :LSUIElement true" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :NSHighResolutionCapable bool true" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :NSLocalNetworkUsageDescription string 'PhoneMic 需要连接局域网中的手机麦克风音频流与自动发现服务。'" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :NSMicrophoneUsageDescription string 'PhoneMic 需要访问系统音频管线以提供虚拟麦克风输入。'" "$PLIST" 2>/dev/null || true
+
+      - name: Ad-hoc codesign
+        run: codesign -s - -f --deep dist/PhoneMic.app
+
+      - name: Package as ZIP
+        run: |
+          cd dist
+          zip -r -y ../PhoneMic-macOS-${{ github.ref_name }}.zip PhoneMic.app
+
+      - name: Upload Mac artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-app
+          path: PhoneMic-macOS-${{ github.ref_name }}.zip
+
+  build-android-apk:
+    name: Build Android APK
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -29,15 +91,38 @@ jobs:
         working-directory: android
         run: ./gradlew assembleDebug --no-daemon
 
-      - name: Rename APK for Release
+      - name: Rename APK
         run: |
           mkdir -p release-assets
           cp android/app/build/outputs/apk/debug/app-debug.apk release-assets/PhoneMic-${{ github.ref_name }}.apk
 
+      - name: Upload Android artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: release-assets/PhoneMic-${{ github.ref_name }}.apk
+
+  create-release:
+    name: Create GitHub Release
+    needs: [build-mac-app, build-android-apk]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Mac artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: mac-app
+          path: release-assets
+
+      - name: Download Android artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: android-apk
+          path: release-assets
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: release-assets/PhoneMic-*.apk
+          files: release-assets/*
           generate_release_notes: true
           draft: false
           prerelease: false

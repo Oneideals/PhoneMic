@@ -47,14 +47,22 @@ import sounddevice as sd
 
 import debuglog
 
-BASE = Path(__file__).resolve().parent   # 项目根（脚本所在目录），保证 clone 到任意位置都能运行
+if getattr(sys, "frozen", False):
+    APP_SUPPORT = Path.home() / "Library" / "Application Support" / "PhoneMic"
+    APP_SUPPORT.mkdir(parents=True, exist_ok=True)
+    BASE = APP_SUPPORT
+    BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+else:
+    BASE = Path(__file__).resolve().parent   # 项目根（脚本所在目录），保证 clone 到任意位置都能运行
+    BUNDLE_DIR = BASE
+
 LAST_URL_FILE = BASE / ".phonemic_last_url"
 LOCK_FILE = BASE / ".phonemic_lock"
 GAIN_FILE = BASE / "gain_db"        # 数字增益（dB），菜单栏应用写入，引擎每秒读取
 LEVEL_FILE = BASE / ".level"        # 引擎实时输出电平（0~100），菜单栏读取显示
 DIAG_FILE = BASE / ".diag"          # 引擎全量实时诊断指标（JSON：抖动、丢包、缓冲、电平），菜单栏读取
 DENOISE_FILE = BASE / "denoise"     # 降噪模式开关（"ai"=神经网络降噪, "fft"=稳态降噪, "0"=关）
-RNNOISE_DIR = BASE / "models" / "rnnoise"
+RNNOISE_DIR = BUNDLE_DIR / "models" / "rnnoise"
 DEFAULT_RNNN = RNNOISE_DIR / "std.rnnn"
 RECORD_FILE = BASE / "record"       # 录音存档开关（"1"=开启）
 PTT_FILE = BASE / ".ptt"            # 录音开关状态（"1"=录音中，单击右⌥切换），菜单栏监听写入

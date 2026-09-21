@@ -23,15 +23,27 @@ import rumps
 import debuglog
 import phonemic   # 复用引擎侧的链路标签/增益上限/配对 token，避免两处各写一份而漂移
 
-BASE = Path(__file__).resolve().parent   # 项目根（脚本所在目录），保证 clone 到任意位置都能运行
-ENGINE = BASE / "phonemic.py"
-_VENV_DIR = BASE / ".venv"
-_VENV_PYTHON = _VENV_DIR / "bin" / "python"
-PYTHON = str(_VENV_PYTHON) if _VENV_PYTHON.exists() and os.access(_VENV_PYTHON, os.X_OK) else sys.executable
+if getattr(sys, "frozen", False):
+    APP_SUPPORT = Path.home() / "Library" / "Application Support" / "PhoneMic"
+    APP_SUPPORT.mkdir(parents=True, exist_ok=True)
+    BASE = APP_SUPPORT
+    BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    ENGINE = BUNDLE_DIR / "phonemic.py"
+    _VENV_DIR = BASE / ".venv"   # frozen 模式下不存在，会自动 fallback 到 sys.executable
+    _VENV_PYTHON = _VENV_DIR / "bin" / "python"
+    PYTHON = sys.executable
+else:
+    BASE = Path(__file__).resolve().parent   # 项目根（脚本所在目录），保证 clone 到任意位置都能运行
+    BUNDLE_DIR = BASE
+    ENGINE = BASE / "phonemic.py"
+    _VENV_DIR = BASE / ".venv"
+    _VENV_PYTHON = _VENV_DIR / "bin" / "python"
+    PYTHON = str(_VENV_PYTHON) if _VENV_PYTHON.exists() and os.access(_VENV_PYTHON, os.X_OK) else sys.executable
+
 APP_NAME = "PhoneMic"
 APP_BUNDLE = Path.home() / "Applications" / f"{APP_NAME}.app"
 LEGACY_AGENT = Path.home() / "Library" / "LaunchAgents" / "com.jerry.phonemic.menu.plist"
-ICON_DIR = BASE / "icons"
+ICON_DIR = BUNDLE_DIR / "icons"
 
 GAIN_FILE = BASE / "gain_db"
 LEVEL_FILE = BASE / ".level"
@@ -104,9 +116,9 @@ def ensure_app_bundle() -> Path:
     <key>CFBundleIdentifier</key>
     <string>com.jerry.phonemic</string>
     <key>CFBundleVersion</key>
-    <string>1.1.0</string>
+    <string>1.2.0</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.1.0</string>
+    <string>1.2.0</string>
     <key>CFBundleExecutable</key>
     <string>PhoneMic</string>
     <key>LSUIElement</key>
