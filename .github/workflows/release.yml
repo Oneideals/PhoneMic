@@ -107,17 +107,11 @@ jobs:
     needs: [build-mac-app, build-android-apk]
     runs-on: ubuntu-latest
     steps:
-      - name: Download Mac artifact
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          name: mac-app
           path: release-assets
-
-      - name: Download Android artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: android-apk
-          path: release-assets
+          merge-multiple: true
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
