@@ -57,6 +57,7 @@ REC_DIR = BASE / "recordings"       # 录音与指标文件目录
 PTT_MIN_SEGMENT = 0.3               # 短于此秒数的录音段视为误触，丢弃
 RECONNECT_FILE = BASE / ".reconnect"   # 菜单栏「立即重连」信号（存在即触发）
 TOKEN_FILE = BASE / ".phonemic_token"  # 配对 token（USB 首次连接自动取回，无线连接凭它鉴权）
+LNP_FLAG_FILE = BASE / ".lnp_blocked"  # macOS 15+ 本地网络隐私（LNP）沙箱拦截诊断标记文件
 # 发现通道端口。做成可覆盖是为了测试自洽：这两个是**系统级**资源，
 # 同机另一个 PhoneMic 实例绑着 58080 时，SO_REUSEADDR 只保证 bind 不报错，
 # 并不保证收得到包 —— 公告会被另一个实例整个吃掉，症状是"死活发现不了手机"。
@@ -1025,6 +1026,7 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
     # 「上次可用地址」，菜单栏的链路面板也会跟着显示一条从未接通的链路
     try:
         LAST_URL_FILE.write_text(url)
+        LNP_FLAG_FILE.unlink(missing_ok=True)
     except Exception:
         pass
     t0 = time.time()
@@ -1425,6 +1427,18 @@ def main():
                 return   # 手机回来了 / 用户点了立即重连：立刻进入发现
             time.sleep(0.1)
 
+    def is_lnp_blocked_error(e: Exception) -> bool:
+        """判定是否为 macOS 15+ 本地网络隐私（Local Network Privacy, LNP）沙箱拦截错误。"""
+        import errno
+        msg = str(e).lower()
+        if "errno 65" in msg or "no route to host" in msg:
+            return True
+        if "operation not permitted" in msg and "errno 1" in msg:
+            return True
+        if isinstance(e, OSError) and getattr(e, "errno", None) in (errno.EHOSTUNREACH, errno.EPERM):
+            return True
+        return False
+
     try:
         while not stop.is_set():
             # 地址解析：显式地址只在首次用；之后每次重连都重新发现（--auto 时）
@@ -1456,6 +1470,22 @@ def main():
                 backoff = min(fails, 6)   # 1,2,3…6：首次失败 1 秒后就重试（发现本身很快）
                 debuglog.log("engine", f"连接失败（本次会话 {dur:.1f}s，第 {fails} 次）："
                                        f"{type(e).__name__}: {e}", exc=True)
+
+                if is_lnp_blocked_error(e):
+                    try:
+                        LNP_FLAG_FILE.write_text(f"{time.time()}:{url}:{e}")
+                    except Exception:
+                        pass
+                    if fails <= 2:
+                        print(
+                            "\n[权限提示] ⚠️ 检测到 macOS 本地网络访问被拦截 (Errno 65: No route to host)。\n"
+                            "  - 无线 Wi-Fi 模式：请在【系统设置 → 隐私与安全性 → 本地网络】中为应用放行；\n"
+                            "  - 极速免权限模式：插上 USB 数据线（走 127.0.0.1 本地回环，完全豁免权限秒连）。\n",
+                            flush=True,
+                        )
+                else:
+                    LNP_FLAG_FILE.unlink(missing_ok=True)
+
                 wait_interruptible(backoff, f"[连接] {e}（第 {fails} 次失败），{backoff}s 后重试")
     except KeyboardInterrupt:
         stop.set()

@@ -9,6 +9,13 @@ import threading
 import time
 from pathlib import Path
 
+# 确保即使由系统 Python 或外部调用拉起，也能自动接入本项目的 .venv 依赖
+_BASE_VENV = Path(__file__).resolve().parent / ".venv"
+if _BASE_VENV.exists():
+    for _sp in (_BASE_VENV / "lib").glob("python*/site-packages"):
+        if str(_sp) not in sys.path:
+            sys.path.insert(0, str(_sp))
+
 import media_ducking
 import rumps
 
@@ -20,7 +27,9 @@ ENGINE = BASE / "phonemic.py"
 _VENV_DIR = BASE / ".venv"
 _VENV_PYTHON = _VENV_DIR / "bin" / "python"
 PYTHON = str(_VENV_PYTHON) if _VENV_PYTHON.exists() and os.access(_VENV_PYTHON, os.X_OK) else sys.executable
-AGENT = Path.home() / "Library" / "LaunchAgents" / "com.jerry.phonemic.menu.plist"
+APP_NAME = "PhoneMic"
+APP_BUNDLE = Path.home() / "Applications" / f"{APP_NAME}.app"
+LEGACY_AGENT = Path.home() / "Library" / "LaunchAgents" / "com.jerry.phonemic.menu.plist"
 ICON_DIR = BASE / "icons"
 
 GAIN_FILE = BASE / "gain_db"
@@ -37,34 +46,148 @@ PREV_INPUT_FILE = BASE / ".prev_input"      # 接管前的原输入设备名（�
 BLACKHOLE_NAME = "BlackHole 2ch"
 
 
-def find_switch_tool() -> str:
-    """查找系统中 SwitchAudioSource CLI 工具路径（兼容 Apple Silicon、Intel 及各种 PATH 场景）。"""
-    if shutil.which("SwitchAudioSource"):
-        return shutil.which("SwitchAudioSource")
-    for p in ("/opt/homebrew/bin/SwitchAudioSource", "/usr/local/bin/SwitchAudioSource"):
-        if Path(p).exists() and os.access(p, os.X_OK):
-            return p
-    return "/opt/homebrew/bin/SwitchAudioSource"
 
 
-SWITCH_TOOL = find_switch_tool()
 GAIN_CHOICES = [0, 3, 6, 9, 12, 15, 18]     # 上限与 phonemic.MAX_GAIN_DB / 手机端保持一致
 RIGHT_OPTION_KEYCODE = 61                   # 右 Option 键码（调试用）
 NX_DEVICERALTKEYMASK = 0x0040               # 右 Option 的设备修饰位（IOLLEvent.h: NX_DEVICERALTKEYMASK）
 SINGLE_CLICK_WINDOW = 0.22                  # 右⌥ 按下后等待其他键的时间窗（秒），超过即判定单击
 LOCK_FILE = BASE / ".phonemic_lock"         # 引擎单实例锁（内容为引擎 PID）
 LAST_URL_FILE = BASE / ".phonemic_last_url" # 最新连通 URL 文件
+BLACKHOLE_NAME = "BlackHole 2ch"
+LNP_FLAG_FILE = BASE / ".lnp_blocked"   # macOS 15+ 本地网络隐私拦截标记
 
-PLIST = f"""<?xml version="1.0" encoding="UTF-8"?>
+
+def find_switch_tool() -> str:
+    """查找系统中 SwitchAudioSource CLI 工具路径（兼容 Apple Silicon、Intel 及各种 PATH 场景）。"""
+    candidates = [
+        "/opt/homebrew/bin/SwitchAudioSource",
+        "/usr/local/bin/SwitchAudioSource",
+        str(Path.home() / ".local/bin/SwitchAudioSource"),
+    ]
+    for c in candidates:
+        if os.path.exists(c) and os.access(c, os.X_OK):
+            return c
+    found = shutil.which("SwitchAudioSource")
+    return found or "SwitchAudioSource"
+
+
+SWITCH_TOOL = find_switch_tool()
+
+
+def ensure_app_bundle() -> Path:
+    """确保 ~/Applications/PhoneMic.app 存在且具备正确结构与权限描述。
+
+    解决 macOS 15 (Sequoia) 本地网络隐私限制（LNP）：
+    macOS 15 对 LaunchAgent 启动的裸 Python 脚本会施加 NPOLICY 隔离并拦截私有局域网连接（Errno 65 No route to host）。
+    打包为标准 App Bundle（声明 NSLocalNetworkUsageDescription + LSUIElement 纯菜单栏常驻），
+    并在可执行启动程序中直接执行虚拟环境 Python，确保具备完整的 Aqua GUI 会话与菜单栏挂载。
+    """
+    contents = APP_BUNDLE / "Contents"
+    macos_dir = contents / "MacOS"
+    macos_dir.mkdir(parents=True, exist_ok=True)
+
+    info_plist = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>com.jerry.phonemic.menu</string>
-  <key>ProgramArguments</key><array>
-    <string>{PYTHON}</string>
-    <string>{BASE / "PhoneMicMenu.py"}</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-</dict></plist>"""
+<plist version="1.0">
+<dict>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>PhoneMic</string>
+    <key>CFBundleDisplayName</key>
+    <string>PhoneMic</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.jerry.phonemic</string>
+    <key>CFBundleVersion</key>
+    <string>1.1.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.1.0</string>
+    <key>CFBundleExecutable</key>
+    <string>PhoneMic</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>PhoneMic 需要连接局域网中的手机麦克风音频流与自动发现服务。</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>PhoneMic 需要访问系统音频管线以提供虚拟麦克风输入。</string>
+</dict>
+</plist>
+"""
+    (contents / "Info.plist").write_text(info_plist)
+
+    # 启动器脚本：配置完整 PATH、进入项目目录，直接运行 Python 保持 Aqua WindowServer 渲染能力
+    launcher = f"""#!/bin/bash
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+PROJECT_DIR="{BASE}"
+cd "$PROJECT_DIR"
+exec "$PROJECT_DIR/.venv/bin/python" "$PROJECT_DIR/PhoneMicMenu.py"
+"""
+    exec_path = macos_dir / "PhoneMic"
+    exec_path.write_text(launcher)
+    exec_path.chmod(0o755)
+    return APP_BUNDLE
+
+
+def is_autostart_enabled() -> bool:
+    """检查开机自启状态（macOS 登录项或遗留 LaunchAgent）。"""
+    try:
+        script = 'tell application "System Events" to get name of every login item'
+        res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=2)
+        if res.returncode == 0:
+            names = [x.strip() for x in res.stdout.split(",")]
+            if APP_NAME in names:
+                return True
+    except Exception:
+        pass
+    return LEGACY_AGENT.exists()
+
+
+def enable_autostart() -> bool:
+    """启用开机自启：生成 App Bundle、注册 macOS 原生登录项，并清理旧 LaunchAgent。"""
+    try:
+        app_path = ensure_app_bundle()
+        # 清理旧 LaunchAgent，杜绝重复自启与沙盒阻断
+        cleanup_legacy_launchagent()
+        # 移除可能存在的同名旧登录项
+        disable_autostart()
+        # 注册原生登录项
+        script = (
+            f'tell application "System Events" to make login item at end '
+            f'with properties {{path:"{app_path}", hidden:false, name:"{APP_NAME}"}}'
+        )
+        res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=3)
+        return res.returncode == 0
+    except Exception as e:
+        debuglog.log("menu", f"开启登录项自启失败: {e}")
+        return False
+
+
+def disable_autostart() -> bool:
+    """关闭开机自启：从 macOS 登录项中移除，并清理旧 LaunchAgent。"""
+    cleanup_legacy_launchagent()
+    try:
+        script = f'tell application "System Events" to delete (every login item whose name is "{APP_NAME}")'
+        res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=3)
+        return res.returncode == 0
+    except Exception as e:
+        debuglog.log("menu", f"移除登录项自启失败: {e}")
+        return False
+
+
+def cleanup_legacy_launchagent():
+    """清理遗留的 LaunchAgent plist，防止旧进程干扰或双开。"""
+    try:
+        if LEGACY_AGENT.exists():
+            subprocess.run(["launchctl", "unload", str(LEGACY_AGENT)], capture_output=True, timeout=2)
+            LEGACY_AGENT.unlink(missing_ok=True)
+            debuglog.log("menu", "已成功卸载并清除旧版 LaunchAgent plist")
+    except Exception as e:
+        debuglog.log("menu", f"清理旧版 LaunchAgent 异常: {e}")
 
 
 def build_icons():
@@ -464,14 +587,20 @@ class PhoneMicMenu(rumps.App):
         self.item_open_rec = rumps.MenuItem("打开录音文件夹", callback=self.on_open_rec)
         self.item_reconnect = rumps.MenuItem("立即重连手机", callback=self.on_reconnect)
         self.item_heal = rumps.MenuItem("声卡与输入法一键体检自愈", callback=self.on_heal)
+        self.item_lnp = rumps.MenuItem("网络权限：✅ 本地网络就绪（点此检查）", callback=self.on_open_lnp)
         self.item_pair = rumps.MenuItem("配对：检查中…", callback=self.on_pair)
         self.item_sys = rumps.MenuItem("接管系统输入（断线自动还原）", callback=self.on_sysinput)
         self.item_sys.state = self._flag_on(SYSINPUT_FILE)
         self._sys_switched = False
         self._last_input_drift_check = 0.0
+        # 自愈旧版 LaunchAgent：若开启了自启且仍在使用旧 Agent，自动无缝迁移至 Login Item
+        if LEGACY_AGENT.exists():
+            debuglog.log("menu", "检测到旧版 LaunchAgent，自动迁移至 macOS 原生登录项")
+            enable_autostart()
+
         self.item_autostart = rumps.MenuItem("开机自启（下次登录生效）",
                                              callback=self.on_autostart)
-        self.item_autostart.state = AGENT.exists()
+        self.item_autostart.state = 1 if is_autostart_enabled() else 0
         gain_items = []
         for db in GAIN_CHOICES:
             it = rumps.MenuItem(f"输出增益 +{db}dB", callback=self.on_gain)
@@ -487,7 +616,7 @@ class PhoneMicMenu(rumps.App):
             None,
             self.item_ptt,
             self.item_duck, self.item_gate, self.item_denoise, self.item_rec, self.item_open_rec,
-            self.item_sys, self.item_heal, self.item_pair, self.item_reconnect,
+            self.item_sys, self.item_heal, self.item_lnp, self.item_pair, self.item_reconnect,
             self.item_toggle, self.item_autostart, None
         ]
         self.sync_gain_state()
@@ -807,9 +936,21 @@ class PhoneMicMenu(rumps.App):
             status_lines.append(f"✅ 虚拟声卡：就绪（输入={in_m}, 输出={out_m}）")
 
         status_lines.append(f"🎤 系统输入：{cur_in or '未知'}")
+        if LNP_FLAG_FILE.exists() and self.status != "streaming":
+            status_lines.append("⚠️ 本地网络：检测到 macOS 拦截局域网访问（建议插 USB 或前往设置放行）")
+        else:
+            status_lines.append("🌐 本地网络：正常")
         msg = " · ".join(status_lines)
-        _show_notification("声卡与输入法体检", msg, sound="Glass")
+        _show_notification("声卡与系统体检", msg, sound="Glass")
         debuglog.log("menu", f"体检自愈结果: {msg}")
+
+    def on_open_lnp(self, sender=None):
+        """一键打开 macOS 15+ 系统设置中的本地网络隐私面板，供用户放行或核验权限。"""
+        debuglog.log("menu", "打开 macOS 本地网络隐私设置面板")
+        try:
+            subprocess.Popen(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork"])
+        except Exception as e:
+            debuglog.log("menu", f"打开系统设置异常: {e}")
 
     def on_open_rec(self, sender):
         try:
@@ -878,30 +1019,64 @@ class PhoneMicMenu(rumps.App):
         self.refresh()
 
     def on_autostart(self, sender):
-        try:
-            if AGENT.exists():
-                subprocess.run(["launchctl", "unload", str(AGENT)],
-                               capture_output=True)
-                AGENT.unlink()
-                sender.state = 0
-            else:
-                AGENT.parent.mkdir(parents=True, exist_ok=True)
-                AGENT.write_text(PLIST)
-                subprocess.run(["launchctl", "load", str(AGENT)], capture_output=True)
-                sender.state = 1
-        except Exception:
-            pass
+        currently_on = is_autostart_enabled()
+        new_state = not currently_on
+        if new_state:
+            ok = enable_autostart()
+            sender.state = 1 if ok else 0
+            msg = "已开启开机自启（macOS 登录项已配置就绪）" if ok else "开启开机自启失败，请检查系统权限"
+        else:
+            ok = disable_autostart()
+            sender.state = 0 if ok else 1
+            msg = "已关闭开机自启" if ok else "关闭开机自启失败"
+        debuglog.log("menu", f"切换开机自启: {msg}")
+        _show_notification("PhoneMic 开机自启", msg, sound=None)
 
     # ---------- 状态刷新 ----------
 
+    def _ensure_status_button(self):
+        """确保在 NSApp 初始化完成后，第一时间完成现代 NSStatusBarButton 的可见性与固定正方形槽位绑定。"""
+        if getattr(self, "_nsitem_initialized", False):
+            return
+        nsitem = getattr(getattr(self, "_nsapp", None), "nsstatusitem", None)
+        if nsitem:
+            import AppKit
+            nsitem.setLength_(AppKit.NSSquareStatusItemLength)
+            nsitem.setVisible_(True)
+            nsitem.setImage_(None)  # 彻底清除 rumps 老接口遗留图片，杜绝双重图片/边距导致的宽度翻倍膨胀
+            btn = getattr(nsitem, "button", lambda: None)()
+            if btn:
+                btn.setImagePosition_(AppKit.NSImageOnly)
+                btn.setTitle_("")
+            self._nsitem_initialized = True
+            # 强制清空缓存，让下方的 _set_icon 100% 写入现代 button
+            self._current_icon = None
+
     def _set_icon(self, path: str):
-        """只在图标路径真正变化时才赋值，彻底杜绝每秒 4 次向 Cocoa 重复创建/释放 NSImage 引发的 CFRelease 崩溃。"""
+        """只在图标路径真正变化时才赋值，直通现代 NSStatusBarButton，锁定固定正方形槽位杜绝任何像素偏移。"""
+        import AppKit
+        if not getattr(self, "_nsitem_initialized", False):
+            self._ensure_status_button()
         if getattr(self, "_current_icon", None) != path:
             self._current_icon = path
+            self._icon = path
             try:
-                self.icon = path
+                # 现代 macOS (10.14+) NSStatusBarButton 纯色块渲染
+                nsitem = getattr(getattr(self, "_nsapp", None), "nsstatusitem", None)
+                if nsitem:
+                    nsitem.setLength_(AppKit.NSSquareStatusItemLength)
+                    nsitem.setVisible_(True)
+                    nsitem.setImage_(None)  # 保持老接口干净，防止系统触发 _updateButton 时重复叠加边距
+                    btn = getattr(nsitem, "button", lambda: None)()
+                    if btn:
+                        img = AppKit.NSImage.alloc().initWithContentsOfFile_(path)
+                        if img:
+                            img.setSize_((18, 18))
+                            btn.setImage_(img)
+                            btn.setImagePosition_(AppKit.NSImageOnly)
+                        btn.setTitle_("")
             except Exception as e:
-                debuglog.log("menu", f"设置图标异常: {e}")
+                debuglog.log("menu", f"设置状态栏按钮异常: {e}")
 
     @staticmethod
     def _set_title(item, title: str):
@@ -913,9 +1088,16 @@ class PhoneMicMenu(rumps.App):
         return self.status == "streaming" and self._flag_on(RECORD_FILE) == 1
 
     def refresh(self):
+        self._ensure_status_button()
         # 配对状态
         self._set_title(self.item_pair, "配对：✅ 已配对（点此修改）" if phonemic.load_token()
                                          else "配对：⚠️ 未配对（插 USB 线自动配对，或点此手填）")
+
+        # 本地网络隐私状态
+        if LNP_FLAG_FILE.exists() and self.status != "streaming":
+            self._set_title(self.item_lnp, "网络权限：⚠️ 局域网被拦截（点此去设置放行）")
+        else:
+            self._set_title(self.item_lnp, "网络权限：✅ 本地网络就绪（点此检查）")
 
         # PTT 监听状态显示
         if self.ptt_error:
@@ -978,7 +1160,7 @@ class PhoneMicMenu(rumps.App):
             except Exception:
                 lv = 0
 
-            is_recording = self.ptt_active
+            is_recording = self.ptt_active or _read_ptt()
             self._set_icon(self.paths["recording" if is_recording else "on"])
             status_tag = "（🎤 录音中）" if is_recording else ""
 
