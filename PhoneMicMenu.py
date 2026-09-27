@@ -92,11 +92,15 @@ SWITCH_TOOL = find_switch_tool()
 def ensure_app_bundle() -> Path:
     """确保 ~/Applications/PhoneMic.app 存在且具备正确结构与权限描述。
 
-    解决 macOS 15 (Sequoia) 本地网络隐私限制（LNP）：
-    macOS 15 对 LaunchAgent 启动的裸 Python 脚本会施加 NPOLICY 隔离并拦截私有局域网连接（Errno 65 No route to host）。
-    打包为标准 App Bundle（声明 NSLocalNetworkUsageDescription + LSUIElement 纯菜单栏常驻），
-    并在可执行启动程序中直接执行虚拟环境 Python，确保具备完整的 Aqua GUI 会话与菜单栏挂载。
+    解决 macOS 15 (Sequoia) 本地网络隐私限制（LNP）与外置硬盘冷启动挂载延迟：
+    1. 声明 NSLocalNetworkUsageDescription + LSUIElement（纯菜单栏常驻应用，不进 Dock）；
+    2. 启动脚本内置等待重试循环（最多 30s），解决外置驱动器在开机登录阶段的延迟挂载问题；
+    3. 输出重定向至 ~/Library/Logs/PhoneMic/launcher.log，保证开机自启排查可见性；
+    4. 若处于 PyInstaller 打包环境，自动复用原 Bundle，防止覆写独立可执行文件。
     """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parents[2]
+
     contents = APP_BUNDLE / "Contents"
     macos_dir = contents / "MacOS"
     macos_dir.mkdir(parents=True, exist_ok=True)
@@ -134,11 +138,30 @@ def ensure_app_bundle() -> Path:
 """
     (contents / "Info.plist").write_text(info_plist)
 
-    # 启动器脚本：配置完整 PATH、进入项目目录，直接运行 Python 保持 Aqua WindowServer 渲染能力
+    # 启动器脚本：增强鲁棒性，等待外置驱动器/路径挂载就绪（防开机登录延迟）、重定向日志便于排查
     launcher = f"""#!/bin/bash
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 PROJECT_DIR="{BASE}"
-cd "$PROJECT_DIR"
+LOG_DIR="$HOME/Library/Logs/PhoneMic"
+mkdir -p "$LOG_DIR"
+exec >> "$LOG_DIR/launcher.log" 2>&1
+echo "=== PhoneMic 自启启动 $(date) (PID: $$) ==="
+
+# 解决外置驱动器在开机登录阶段的延迟挂载问题（最多等待 30 秒）
+for i in {{1..30}}; do
+    if [ -d "$PROJECT_DIR" ] && [ -x "$PROJECT_DIR/.venv/bin/python" ]; then
+        break
+    fi
+    echo "[$i/30] 等待项目目录挂载就绪: $PROJECT_DIR"
+    sleep 1
+done
+
+if [ ! -d "$PROJECT_DIR" ] || [ ! -x "$PROJECT_DIR/.venv/bin/python" ]; then
+    echo "错误: 项目路径或 Python 虚拟环境不存在: $PROJECT_DIR"
+    exit 1
+fi
+
+cd "$PROJECT_DIR" || exit 1
 exec "$PROJECT_DIR/.venv/bin/python" "$PROJECT_DIR/PhoneMicMenu.py"
 """
     exec_path = macos_dir / "PhoneMic"
@@ -150,14 +173,26 @@ exec "$PROJECT_DIR/.venv/bin/python" "$PROJECT_DIR/PhoneMicMenu.py"
 def is_autostart_enabled() -> bool:
     """检查开机自启状态（macOS 登录项或遗留 LaunchAgent）。"""
     try:
-        script = 'tell application "System Events" to get name of every login item'
-        res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=2)
-        if res.returncode == 0:
-            names = [x.strip() for x in res.stdout.split(",")]
-            if APP_NAME in names:
-                return True
-    except Exception:
-        pass
+        # 兼容 PhoneMic、PhoneMic.app 以及绝对路径匹配，消除扩展名与命名差异
+        script = f'''tell application "System Events"
+            if (exists (login item "{APP_NAME}")) or (exists (login item "{APP_NAME}.app")) then
+                return true
+            end if
+            repeat with itm in (get every login item)
+                try
+                    set p to (path of itm as text)
+                    if p contains "{APP_NAME}" then
+                        return true
+                    end if
+                end try
+            end repeat
+            return false
+        end tell'''
+        res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=5)
+        if res.returncode == 0 and "true" in res.stdout.strip().lower():
+            return True
+    except Exception as e:
+        debuglog.log("menu", f"检查登录项自启异常: {e}")
     return LEGACY_AGENT.exists()
 
 
@@ -167,17 +202,29 @@ def enable_autostart() -> bool:
         app_path = ensure_app_bundle()
         # 清理旧 LaunchAgent，杜绝重复自启与沙盒阻断
         cleanup_legacy_launchagent()
-        # 移除可能存在的同名旧登录项
-        disable_autostart()
-        # 注册原生登录项
-        script = (
-            f'tell application "System Events" to make login item at end '
-            f'with properties {{path:"{app_path}", hidden:false, name:"{APP_NAME}"}}'
-        )
-        res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=3)
-        return res.returncode == 0
+        # 在单次 AppleScript 中完成旧项清理与新项注册，避免多次 IPC 往返超时
+        script = f'''tell application "System Events"
+            delete (every login item whose name is "{APP_NAME}")
+            delete (every login item whose name is "{APP_NAME}.app")
+            repeat with itm in (get every login item)
+                try
+                    if (path of itm as text) contains "{APP_NAME}" then
+                        delete itm
+                    end if
+                end try
+            end repeat
+            make login item at end with properties {{path:"{app_path}", hidden:false, name:"{APP_NAME}"}}
+        end tell'''
+        res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=8)
+        if res.returncode == 0:
+            debuglog.log("menu", f"成功添加登录项: {app_path}")
+            return True
+        else:
+            err = res.stderr.strip() if res.stderr else "未知错误"
+            debuglog.log("menu", f"添加登录项失败 (code={res.returncode}): {err}")
+            return False
     except Exception as e:
-        debuglog.log("menu", f"开启登录项自启失败: {e}")
+        debuglog.log("menu", f"开启登录项自启异常: {e}")
         return False
 
 
@@ -185,11 +232,27 @@ def disable_autostart() -> bool:
     """关闭开机自启：从 macOS 登录项中移除，并清理旧 LaunchAgent。"""
     cleanup_legacy_launchagent()
     try:
-        script = f'tell application "System Events" to delete (every login item whose name is "{APP_NAME}")'
-        res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=3)
-        return res.returncode == 0
+        script = f'''tell application "System Events"
+            delete (every login item whose name is "{APP_NAME}")
+            delete (every login item whose name is "{APP_NAME}.app")
+            repeat with itm in (get every login item)
+                try
+                    if (path of itm as text) contains "{APP_NAME}" then
+                        delete itm
+                    end if
+                end try
+            end repeat
+        end tell'''
+        res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=8)
+        if res.returncode == 0:
+            debuglog.log("menu", "已成功从登录项中移除 PhoneMic")
+            return True
+        else:
+            err = res.stderr.strip() if res.stderr else "未知错误"
+            debuglog.log("menu", f"移除登录项失败 (code={res.returncode}): {err}")
+            return False
     except Exception as e:
-        debuglog.log("menu", f"移除登录项自启失败: {e}")
+        debuglog.log("menu", f"移除登录项自启异常: {e}")
         return False
 
 
@@ -621,7 +684,9 @@ class PhoneMicMenu(rumps.App):
 
         self.item_autostart = rumps.MenuItem("开机自启（下次登录生效）",
                                              callback=self.on_autostart)
-        self.item_autostart.state = 1 if is_autostart_enabled() else 0
+        self._last_autostart_check = 0.0
+        self._checking_autostart = False
+        self.sync_autostart_state(force=True)
         gain_items = []
         for db in GAIN_CHOICES:
             it = rumps.MenuItem(f"输出增益 +{db}dB", callback=self.on_gain)
@@ -1082,19 +1147,38 @@ class PhoneMicMenu(rumps.App):
             self.proc.terminate()   # 让引擎带着新 token 重连
         self.refresh()
 
+    def sync_autostart_state(self, force: bool = False):
+        """异步核验并同步开机自启勾选状态，杜绝阻塞主线程 RunLoop。"""
+        now = time.time()
+        if not force and (now - getattr(self, "_last_autostart_check", 0) < 5.0 or getattr(self, "_checking_autostart", False)):
+            return
+        self._last_autostart_check = now
+        self._checking_autostart = True
+
+        def _worker():
+            try:
+                enabled = is_autostart_enabled()
+                self.item_autostart.state = 1 if enabled else 0
+            except Exception:
+                pass
+            finally:
+                self._checking_autostart = False
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     def on_autostart(self, sender):
         currently_on = is_autostart_enabled()
         new_state = not currently_on
         if new_state:
             ok = enable_autostart()
-            sender.state = 1 if ok else 0
             msg = "已开启开机自启（macOS 登录项已配置就绪）" if ok else "开启开机自启失败，请检查系统权限"
         else:
             ok = disable_autostart()
-            sender.state = 0 if ok else 1
             msg = "已关闭开机自启" if ok else "关闭开机自启失败"
+        sender.state = 1 if (new_state and ok) else (0 if (not new_state and ok) else sender.state)
         debuglog.log("menu", f"切换开机自启: {msg}")
         _show_notification("PhoneMic 开机自启", msg, sound=None)
+        self.sync_autostart_state(force=True)
 
     # ---------- 状态刷新 ----------
 
@@ -1157,6 +1241,7 @@ class PhoneMicMenu(rumps.App):
     def refresh(self):
         self._ensure_status_button()
         self.sync_denoise_state()
+        self.sync_autostart_state()
         # 配对状态
         self._set_title(self.item_pair, "配对：✅ 已配对（点此修改）" if phonemic.load_token()
                                          else "配对：⚠️ 未配对（插 USB 线自动配对，或点此手填）")

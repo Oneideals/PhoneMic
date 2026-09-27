@@ -499,6 +499,52 @@ def test_build_denoise_filter():
     check("降噪构建: FFT 稳态模式包含 afftdn", "afftdn" in flt_fft and mode_fft == "fft")
 
 
+# ---------- 18. 开机自启逻辑与 App Bundle 启动器稳健性 ----------
+
+def test_autostart_logic():
+    """验证开机自启核心逻辑：App Bundle 生成、挂载等待重试脚本、登录项指令解析与容错。"""
+    import subprocess
+    import PhoneMicMenu
+
+    with tempfile.TemporaryDirectory() as d:
+        temp_app = Path(d) / "PhoneMic.app"
+        orig_app = PhoneMicMenu.APP_BUNDLE
+        PhoneMicMenu.APP_BUNDLE = temp_app
+        try:
+            # 1. 验证 App Bundle 生成
+            bundle = PhoneMicMenu.ensure_app_bundle()
+            check("自启逻辑: 生成 App Bundle 路径正确", bundle == temp_app)
+            plist = (temp_app / "Contents" / "Info.plist").read_text()
+            check("自启逻辑: Info.plist 包含 LSUIElement", "<key>LSUIElement</key>" in plist)
+            check("自启逻辑: Info.plist 声明本地网络权限", "NSLocalNetworkUsageDescription" in plist)
+
+            # 2. 验证启动脚本包含外置硬盘挂载等待循环与日志重定向
+            launcher = (temp_app / "Contents" / "MacOS" / "PhoneMic").read_text()
+            check("自启逻辑: 启动器包含外置硬盘挂载重试循环", "for i in {1..30}; do" in launcher)
+            check("自启逻辑: 启动器重定向日志至 ~/Library/Logs/PhoneMic", 'LOG_DIR="$HOME/Library/Logs/PhoneMic"' in launcher)
+
+            # 3. 验证 is_autostart_enabled 模拟解析
+            orig_run = subprocess.run
+            try:
+                # 模拟 true 返回
+                subprocess.run = lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, stdout="true\n", stderr="")
+                check("自启逻辑: 模拟返回 true 时判定自启已开启", PhoneMicMenu.is_autostart_enabled() is True)
+
+                # 模拟 false 返回
+                subprocess.run = lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, stdout="false\n", stderr="")
+                check("自启逻辑: 模拟返回 false 时判定自启未开启", PhoneMicMenu.is_autostart_enabled() is False)
+
+                # 模拟超时或异常时安全回退
+                def _raise(*args, **kwargs):
+                    raise subprocess.TimeoutExpired(cmd="osascript", timeout=5)
+                subprocess.run = _raise
+                check("自启逻辑: osascript 超时时安全优雅处理未崩溃", PhoneMicMenu.is_autostart_enabled() in (True, False))
+            finally:
+                subprocess.run = orig_run
+        finally:
+            PhoneMicMenu.APP_BUNDLE = orig_app
+
+
 if __name__ == "__main__":
     for fn in (test_lock_preserves_holder_pid,
                test_probe_ok_accepts_udp_url,
@@ -516,7 +562,8 @@ if __name__ == "__main__":
                test_scan_host_recognizes_401_as_hit,
                test_udp_receiver_metrics_jitter_and_loss,
                test_http_stream_metrics,
-               test_build_denoise_filter):
+               test_build_denoise_filter,
+               test_autostart_logic):
         try:
             fn()
         except Exception as e:
