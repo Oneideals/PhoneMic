@@ -516,11 +516,14 @@ def test_autostart_logic():
             check("自启逻辑: 生成 App Bundle 路径正确", bundle == temp_app)
             plist = (temp_app / "Contents" / "Info.plist").read_text()
             check("自启逻辑: Info.plist 包含 LSUIElement", "<key>LSUIElement</key>" in plist)
+            check("自启逻辑: Info.plist 包含 NSSupportsAutomaticTermination", "NSSupportsAutomaticTermination" in plist)
             check("自启逻辑: Info.plist 声明本地网络权限", "NSLocalNetworkUsageDescription" in plist)
 
-            # 2. 验证启动脚本包含外置硬盘挂载等待循环与日志重定向
+            # 2. 验证启动脚本包含外置硬盘挂载等待循环、macOS 27 MenuBarAgent 就绪等待与软链接自愈
             launcher = (temp_app / "Contents" / "MacOS" / "PhoneMic").read_text()
             check("自启逻辑: 启动器包含外置硬盘挂载重试循环", "for i in {1..30}; do" in launcher)
+            check("自启逻辑: 启动器包含 macOS 27 MenuBarAgent 状态栏就绪等待", "MenuBarAgent" in launcher)
+            check("自启逻辑: 启动器包含 Python 软链接自愈逻辑", "ln -sf" in launcher)
             check("自启逻辑: 启动器重定向日志至 ~/Library/Logs/PhoneMic", 'LOG_DIR="$HOME/Library/Logs/PhoneMic"' in launcher)
 
             # 3. 验证 is_autostart_enabled 模拟解析

@@ -1464,7 +1464,7 @@ def stream_once(url: str, out_idx: int, stop: threading.Event) -> None:
 
     print(f"[音频] {rate} Hz / {ch} ch / {bits}bit，写入 BlackHole…（Ctrl+C 退出）", flush=True)
     debuglog.log("engine", f"开始推流：{rate}Hz {ch}ch {bits}bit 源={hb['src']} "
-                           f"降噪={denoise} 输出设备={out_idx} url={url}")
+                           f"降噪={actual_denoise} 输出设备={out_idx} url={url}")
     try:
         with sd.OutputStream(device=out_idx, samplerate=rate, channels=ch,
                              dtype=dtype, callback=callback):

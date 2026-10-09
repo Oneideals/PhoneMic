@@ -92,11 +92,14 @@ SWITCH_TOOL = find_switch_tool()
 def ensure_app_bundle() -> Path:
     """确保 ~/Applications/PhoneMic.app 存在且具备正确结构与权限描述。
 
-    解决 macOS 15 (Sequoia) 本地网络隐私限制（LNP）与外置硬盘冷启动挂载延迟：
+    全面适配 macOS 15+ (Sequoia) 与 macOS 27 (MenuBarAgent / FrontBoard Scene)：
     1. 声明 NSLocalNetworkUsageDescription + LSUIElement（纯菜单栏常驻应用，不进 Dock）；
-    2. 启动脚本内置等待重试循环（最多 30s），解决外置驱动器在开机登录阶段的延迟挂载问题；
-    3. 输出重定向至 ~/Library/Logs/PhoneMic/launcher.log，保证开机自启排查可见性；
-    4. 若处于 PyInstaller 打包环境，自动复用原 Bundle，防止覆写独立可执行文件。
+    2. 声明 NSSupportsAutomaticTermination / NSSupportsSuddenTermination 为 false，防止系统静默杀进程；
+    3. 启动脚本内置外置驱动器挂载等待循环（最多 30s）；
+    4. 启动脚本自愈 Homebrew Python 小版本升级断裂的 .venv 软链接；
+    5. 启动脚本探测 macOS 27 MenuBarAgent / WindowServer GUI 状态栏就绪，彻底避免冷启动 Scene 握手丢失；
+    6. 输出重定向至 ~/Library/Logs/PhoneMic/launcher.log，保证排查可见性；
+    7. 若处于 PyInstaller 打包环境，自动复用原 Bundle，防止覆写独立可执行文件。
     """
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parents[2]
@@ -129,6 +132,10 @@ def ensure_app_bundle() -> Path:
     <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSSupportsAutomaticTermination</key>
+    <false/>
+    <key>NSSupportsSuddenTermination</key>
+    <false/>
     <key>NSLocalNetworkUsageDescription</key>
     <string>PhoneMic 需要连接局域网中的手机麦克风音频流与自动发现服务。</string>
     <key>NSMicrophoneUsageDescription</key>
@@ -138,7 +145,7 @@ def ensure_app_bundle() -> Path:
 """
     (contents / "Info.plist").write_text(info_plist)
 
-    # 启动器脚本：增强鲁棒性，等待外置驱动器/路径挂载就绪（防开机登录延迟）、重定向日志便于排查
+    # 启动器脚本：增强鲁棒性，等待外置驱动器就绪、自愈 Python 软链接、等待 macOS 27 MenuBarAgent 就绪
     launcher = f"""#!/bin/bash
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 PROJECT_DIR="{BASE}"
@@ -156,10 +163,34 @@ for i in {{1..30}}; do
     sleep 1
 done
 
+# 自愈 Homebrew Python 小版本升级导致的 .venv 软链接失效
+if [ -d "$PROJECT_DIR/.venv" ]; then
+    if [ ! -x "$PROJECT_DIR/.venv/bin/python" ] || [ ! -x "$PROJECT_DIR/.venv/bin/python3" ]; then
+        SYS_PY=$(which python3.13 2>/dev/null || which python3 2>/dev/null)
+        if [ -n "$SYS_PY" ] && [ -x "$SYS_PY" ]; then
+            echo "自愈 .venv Python 解释器软链接: $SYS_PY"
+            ln -sf "$SYS_PY" "$PROJECT_DIR/.venv/bin/python3.13" 2>/dev/null
+            ln -sf python3.13 "$PROJECT_DIR/.venv/bin/python" 2>/dev/null
+            ln -sf python3.13 "$PROJECT_DIR/.venv/bin/python3" 2>/dev/null
+        fi
+    fi
+fi
+
 if [ ! -d "$PROJECT_DIR" ] || [ ! -x "$PROJECT_DIR/.venv/bin/python" ]; then
     echo "错误: 项目路径或 Python 虚拟环境不存在: $PROJECT_DIR"
     exit 1
 fi
+
+# 适配 macOS 27 (MenuBarAgent) 与开机冷启动时序：等待系统 GUI 会话与 MenuBarAgent 就绪
+for i in {{1..15}}; do
+    if pgrep -x MenuBarAgent >/dev/null 2>&1 || pgrep -x WindowServer >/dev/null 2>&1; then
+        # 给予 MenuBarAgent 场景注册与状态栏布局 1.5 秒稳定缓冲期，杜绝冷启动 Scene 握手丢失
+        sleep 1.5
+        break
+    fi
+    echo "[$i/15] 等待系统 GUI / MenuBarAgent 就绪..."
+    sleep 1
+done
 
 cd "$PROJECT_DIR" || exit 1
 exec "$PROJECT_DIR/.venv/bin/python" "$PROJECT_DIR/PhoneMicMenu.py"
@@ -168,6 +199,7 @@ exec "$PROJECT_DIR/.venv/bin/python" "$PROJECT_DIR/PhoneMicMenu.py"
     exec_path.write_text(launcher)
     exec_path.chmod(0o755)
     return APP_BUNDLE
+
 
 
 def is_autostart_enabled() -> bool:
@@ -278,7 +310,7 @@ def build_icons():
         "recording": ("fill", (0.15, 0.85, 0.35, 1.0)),     # 🟢 录音/语音输入锁定：亮绿实心圆
         "on": ("fill", (0.20, 0.60, 1.0, 1.0)),            # 🔵 连通待命：清澈亮天蓝实心圆（常驻显色）
         "connecting": ("ring", (0.96, 0.60, 0.15, 0.95)),  # 🟠 探测寻找中：亮橙色空心圆环
-        "stopped": ("ring", (0.55, 0.55, 0.55, 0.50)),      # ⭕ 手动停止：暗灰色空心圆环
+        "stopped": ("ring", (0.60, 0.60, 0.60, 0.75)),      # ⭕ 手动停止：暗灰色空心圆环（提升暗色/亮色壁纸对比度）
     }
     for kind, (mode, color) in specs.items():
         img = AppKit.NSImage.alloc().initWithSize_((size, size))
@@ -636,6 +668,12 @@ class PhoneMicMenu(rumps.App):
         )
         _ensure_edit_menu()
         super().__init__(name="PhoneMic", quit_button="退出 PhoneMic")
+        # 针对已安装的 App Bundle，自动保持启动器与 Info.plist 具备 macOS 27 深度适配能力
+        if APP_BUNDLE.exists() and not getattr(sys, "frozen", False):
+            try:
+                ensure_app_bundle()
+            except Exception as e:
+                debuglog.log("menu", f"自愈 App Bundle 启动器异常: {e}")
         self.paths = build_icons()
         self._current_icon = self.paths["stopped"]
         self.icon = self.paths["stopped"]
@@ -1069,6 +1107,16 @@ class PhoneMicMenu(rumps.App):
             status_lines.append("⚠️ 本地网络：检测到 macOS 拦截局域网访问（建议插 USB 或前往设置放行）")
         else:
             status_lines.append("🌐 本地网络：正常")
+
+        # 检查并自愈 macOS 27 菜单栏状态项与按钮有效性
+        try:
+            self._ensure_status_button(force=True)
+            cur_icon = getattr(self, "_current_icon", None) or self.paths.get(self.status, self.paths.get("stopped"))
+            self._set_icon(cur_icon, force=True)
+            status_lines.append("🍏 菜单栏：就绪（macOS 27 场景已绑定）")
+        except Exception as e:
+            debuglog.log("menu", f"体检菜单栏自愈异常: {e}")
+
         msg = " · ".join(status_lines)
         _show_notification("声卡与系统体检", msg, sound="Glass")
         debuglog.log("menu", f"体检自愈结果: {msg}")
@@ -1182,9 +1230,9 @@ class PhoneMicMenu(rumps.App):
 
     # ---------- 状态刷新 ----------
 
-    def _ensure_status_button(self):
-        """确保在 NSApp 初始化完成后，第一时间完成现代 NSStatusBarButton 的可见性与固定正方形槽位绑定。"""
-        if getattr(self, "_nsitem_initialized", False):
+    def _ensure_status_button(self, force: bool = False):
+        """确保在 NSApp 初始化完成后，第一时间完成现代 NSStatusBarButton 的可见性、固定正方形槽位与 macOS 27 MenuBarAgent 场景持久化。"""
+        if getattr(self, "_nsitem_initialized", False) and not force:
             return
         nsitem = getattr(getattr(self, "_nsapp", None), "nsstatusitem", None)
         if nsitem:
@@ -1194,35 +1242,55 @@ class PhoneMicMenu(rumps.App):
             )
             nsitem.setLength_(AppKit.NSSquareStatusItemLength)
             nsitem.setVisible_(True)
+            # 深度适配 macOS 27 (MenuBarAgent)：注册固定 autosaveName，使 MenuBarOrderPersistenceComponent 记住其位置，防止冷启/排版重构时被作为匿名临时项推至最左侧淘汰
+            if hasattr(nsitem, "setAutosaveName_"):
+                try:
+                    nsitem.setAutosaveName_("PhoneMic")
+                except Exception:
+                    pass
             nsitem.setImage_(None)  # 彻底清除 rumps 老接口遗留图片，杜绝双重图片/边距导致的宽度翻倍膨胀
             btn = getattr(nsitem, "button", lambda: None)()
             if btn:
                 btn.setImagePosition_(AppKit.NSImageOnly)
                 btn.setTitle_("")
+                # 适配 macOS 27 MenuBarOverflowComponent 抽屉与无障碍读取
+                if hasattr(btn, "setToolTip_"):
+                    btn.setToolTip_("PhoneMic: 手机无线麦克风")
+                if hasattr(btn, "setAccessibilityLabel_"):
+                    btn.setAccessibilityLabel_("PhoneMic 状态指示")
+                if hasattr(btn, "setAccessibilityTitle_"):
+                    btn.setAccessibilityTitle_("PhoneMic")
             self._nsitem_initialized = True
             # 强制清空缓存，让下方的 _set_icon 100% 写入现代 button
             self._current_icon = None
 
-    def _set_icon(self, path: str):
-        """只在图标路径真正变化时才赋值，直通现代 NSStatusBarButton，锁定固定正方形槽位杜绝任何像素偏移。"""
+    def _set_icon(self, path: str, force: bool = False):
+        """只在图标路径变化或系统重绘丢失图像时才赋值，直通现代 NSStatusBarButton，锁定固定正方形槽位杜绝任何像素偏移。"""
         import AppKit
         if not getattr(self, "_nsitem_initialized", False):
             self._ensure_status_button()
-        if getattr(self, "_current_icon", None) != path:
+        nsitem = getattr(getattr(self, "_nsapp", None), "nsstatusitem", None)
+        btn = getattr(nsitem, "button", lambda: None)() if nsitem else None
+        # 深度适配 macOS 27 多屏热插拔、深浅色模式切换与 MenuBarAgent 场景重绘：若系统丢失了图像，主动自愈重载
+        needs_update = (
+            force
+            or getattr(self, "_current_icon", None) != path
+            or (btn is not None and btn.image() is None)
+        )
+        if needs_update and path:
             self._current_icon = path
             self._icon = path
             try:
-                # 现代 macOS (10.14+) NSStatusBarButton 纯色块渲染
-                nsitem = getattr(getattr(self, "_nsapp", None), "nsstatusitem", None)
+                # 现代 macOS (10.14+ / macOS 27) NSStatusBarButton 纯色块渲染
                 if nsitem:
                     nsitem.setLength_(AppKit.NSSquareStatusItemLength)
                     nsitem.setVisible_(True)
                     nsitem.setImage_(None)  # 保持老接口干净，防止系统触发 _updateButton 时重复叠加边距
-                    btn = getattr(nsitem, "button", lambda: None)()
                     if btn:
                         img = AppKit.NSImage.alloc().initWithContentsOfFile_(path)
                         if img:
                             img.setSize_((18, 18))
+                            img.setTemplate_(False)  # 锁定色彩，杜绝深浅色切换时被系统误灰度化
                             btn.setImage_(img)
                             btn.setImagePosition_(AppKit.NSImageOnly)
                         btn.setTitle_("")
